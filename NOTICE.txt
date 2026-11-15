@@ -1,0 +1,6 @@
+FlipSide incorporates modified source files derived from the Vocabulary Builder
+plugin in the KOReader project, and user-provided flashcard, audit, virtual
+filter, full-sentence and dictionary-position-lock patches.
+Respect the source licenses for any redistribution.
+Upstream KOReader: https://github.com/koreader/koreader
+Upstream license: AGPL-3.0, https://github.com/koreader/koreader/blob/master/COPYING
