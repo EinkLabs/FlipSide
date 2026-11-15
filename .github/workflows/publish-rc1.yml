@@ -1,0 +1,41 @@
+name: Publish FlipSide 1.0.0-rc.1 (pre-release)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/publish-rc1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'EinkLabs/FlipSide' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends luajit
+      - name: Verify existing source, SQLite schema and packaging tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run isolated Lua regression tests
+        run: luajit tests/run.lua
+      - name: Build installation-only archive
+        run: python3 scripts/build_release.py
+      - name: Verify the release archive
+        run: python3 -m unittest discover -s tests -p 'test_release.py' -v
+      - name: Publish release candidate without changing plugin code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view v1.0.0-rc.1 >/dev/null 2>&1; then
+            echo "Release v1.0.0-rc.1 already exists; leaving it unchanged."
+            exit 0
+          fi
+          gh release create v1.0.0-rc.1             dist/FlipSide-1.0.0-rc.1.zip             --title "FlipSide 1.0.0-rc.1"             --notes-file RELEASE_NOTES.md             --target "$GITHUB_SHA"             --prerelease
