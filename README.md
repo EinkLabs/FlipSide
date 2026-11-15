@@ -51,3 +51,7 @@ Sync one device at a time, and keep a separate backup: cloud synchronization is 
 **Compatibility:** KOReader; behaviour may depend on device and KOReader version. For bugs, share your device type, KOReader version and *sanitized* logs — never credentials or personal databases.
 
 **License:** [AGPL-3.0](COPYING). Based in part on KOReader's Vocabulary Builder; see [NOTICE](NOTICE.txt) and [upstream KOReader](https://github.com/koreader/koreader).
+
+## Screenshot gallery
+
+[View all 20 additional FlipSide screenshots](docs/GALLERY.md)
