@@ -1,6 +1,9 @@
 name: Update FlipSide from ZIP
 
 on:
+  push:
+    branches: [release-upload]
+    paths: ['FlipSide-*-upload.zip']
   workflow_dispatch:
     inputs:
       version:
@@ -21,7 +24,7 @@ concurrency:
 
 jobs:
   update:
-    if: github.repository == 'EinkLabs/FlipSide' && github.ref == 'refs/heads/main'
+    if: github.repository == 'EinkLabs/FlipSide' && (github.ref == 'refs/heads/main' || (github.event_name == 'push' && github.ref == 'refs/heads/release-upload'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -31,8 +34,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
+      - name: Read ZIP uploaded to release-upload
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          git fetch origin release-upload
+          mapfile -t files < <(git diff --name-only --diff-filter=AM "$BEFORE" "$GITHUB_SHA" -- 'FlipSide-*-upload.zip')
+          [[ ${#files[@]} -eq 1 ]] || { echo 'Upload exactly one new ZIP per commit'; exit 1; }
+          file="${files[0]}"
+          [[ "$file" =~ ^FlipSide-([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?)-upload\.zip$ ]] || { echo 'Invalid filename'; exit 1; }
+          version="v${BASH_REMATCH[1]}"
+          if git show-ref --verify --quiet "refs/tags/$version" || gh release view "$version" >/dev/null 2>&1; then
+            echo 'Version already exists; refusing to overwrite it.'; exit 1
+          fi
+          git show "$GITHUB_SHA:$file" > "$RUNNER_TEMP/input.zip"
+          [[ $(stat -c %s "$RUNNER_TEMP/input.zip") -le 52428800 ]] || exit 1
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo 'VALIDATE_ONLY=false' >> "$GITHUB_ENV"
       - name: Download exactly one ZIP from an unpublished draft
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || { echo "Use a version such as v1.0.1"; exit 1; }
@@ -184,13 +208,25 @@ jobs:
             echo "Validation only: source and draft were not changed." >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Publish validated source and release
-        if: inputs.validate_only == false
+        if: github.event_name == 'push' || inputs.validate_only == false
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if ! git diff --cached --quiet; then
             git commit -m "Update FlipSide to $VERSION"
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'push' ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1 || gh release view "$VERSION" >/dev/null 2>&1; then
+              echo 'Version already exists'; exit 1
+            fi
+            git tag "$VERSION"
+            git push --atomic origin HEAD:refs/heads/main "refs/tags/$VERSION"
+            args=()
+            if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
+            gh release create "$VERSION" "$RUNNER_TEMP/FlipSide-${VERSION#v}.zip" --verify-tag --title "FlipSide ${VERSION#v}" --notes-file RELEASE_NOTES.md "${args[@]}"
+            echo "Published $VERSION" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           # Make sure the draft still contains the same input asset.
           gh release view "$VERSION" --json isDraft,assets,tagName > "$RUNNER_TEMP/current-draft.json"
