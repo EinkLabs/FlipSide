@@ -120,6 +120,45 @@ jobs:
               shutil.rmtree(plugin)
               shutil.copytree(stage, plugin)
           PY
+      - name: Apply optional release documentation
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, zipfile, re
+          root = pathlib.Path.cwd()
+          with zipfile.ZipFile(pathlib.Path(os.environ["RUNNER_TEMP"]) / "input.zip") as z:
+              names = set(z.namelist())
+              screenshot = "release-assets/saved-meaning-popup.jpg"
+              notes = "release-assets/RELEASE_NOTES.md"
+              if screenshot in names:
+                  info = z.getinfo(screenshot)
+                  if info.file_size > 5 * 1024 * 1024:
+                      raise SystemExit("Screenshot exceeds size limit")
+                  data = z.read(info)
+                  if not data.startswith(b"\xff\xd8\xff") or not data.endswith(b"\xff\xd9"):
+                      raise SystemExit("Expected a JPEG screenshot")
+                  old = root / "docs/gallery/238240-dictionary-definition-2.jpg"
+                  new = root / "docs/gallery/saved-meaning-popup.jpg"
+                  new.write_bytes(data)
+                  gallery = root / "docs/GALLERY.md"
+                  text = gallery.read_text(encoding="utf-8")
+                  text = text.replace("**Dictionary definition example 2** — original `238240.jpg`", "**Saved meaning popup — updated dark-mode example**")
+                  text = text.replace("gallery/238240-dictionary-definition-2.jpg", "gallery/saved-meaning-popup.jpg").replace('alt="Dictionary definition example 2"', 'alt="Saved meaning popup over a visible flashcard"')
+                  text = text.replace("All 20 original screenshots are preserved here with unchanged image pixels and descriptive filenames.", "Original and updated screenshots are shown with descriptive filenames.")
+                  text = text.replace("These images document the `1.0.0-rc.1` user interface;", "These images document the FlipSide user interface;")
+                  gallery.write_text(text, encoding="utf-8")
+                  if old.exists():
+                      old.unlink()
+              if notes in names:
+                  info = z.getinfo(notes)
+                  if info.file_size > 32768:
+                      raise SystemExit("Release notes exceed size limit")
+                  text = z.read(info).decode("utf-8")
+                  if not text.strip():
+                      raise SystemExit("Empty release notes")
+                  (root / "RELEASE_NOTES.md").write_text(text, encoding="utf-8")
+                  with open(os.environ["GITHUB_ENV"], "a") as env:
+                      print("BUNDLED_NOTES=true", file=env)
+          PY
       - name: Install LuaJIT
         run: |
           sudo apt-get update -qq
@@ -137,7 +176,7 @@ jobs:
       - name: Review changes and prepare versioned installer
         run: |
           set -euo pipefail
-          git add -A -- flipside.koplugin
+          git add -A -- flipside.koplugin docs/gallery docs/GALLERY.md RELEASE_NOTES.md
           git diff --cached --check
           git diff --cached --stat
           cp dist/FlipSide-1.0.0-rc.1.zip "$RUNNER_TEMP/FlipSide-${VERSION#v}.zip"
@@ -169,6 +208,9 @@ jobs:
           gh release upload "$VERSION" "$RUNNER_TEMP/$asset" --clobber
           if [[ "$INPUT_ASSET" != "$asset" ]]; then
             gh release delete-asset "$VERSION" "$INPUT_ASSET" --yes
+          fi
+          if [[ "${BUNDLED_NOTES:-false}" == "true" ]]; then
+            gh release edit "$VERSION" --notes-file RELEASE_NOTES.md
           fi
           if [[ "$VERSION" == *-* ]]; then
             gh release edit "$VERSION" --draft=false --prerelease=true
