@@ -4903,10 +4903,9 @@ function Flashcards:stepCard(direction)
     return true
 end
 
--- A time-based due watcher for cards ALREADY present in the catalog.
--- No polling: use a single KOReader timer set for the next real SRS due date
--- or the midnight deadline for Advance Today. Unlike reloadDeck(), this
--- inserts cards without replacing the current card, Undo history, or CRAM.
+-- A one-shot watcher for real SRS deadlines, including the next review of
+-- cards already answered in a completed batch. The active batch is kept
+-- intact; a fresh batch starts only when a completed card becomes due.
 function Flashcards:_stopDueWatch()
     if self._due_watch_action then
         UIManager:unschedule(self._due_watch_action)
@@ -4922,6 +4921,18 @@ function Flashcards:_appendNewlyDue()
             or self.busy or self._inspection_cursor then return 0 end
     local now = os.time()
     local t0, y0 = dayStart(0), dayStart(1)
+    if self.state == "done" or self.state == "empty" then
+        for _, card in ipairs(self.all_cards or {}) do
+            if card.done and not card._retry_pending
+                    and type(card.due) == "number" and card.due <= now
+                    and cardMatches(card, self.filter, t0, y0, true) then
+                -- Re-read SQLite rather than clearing done on a historical
+                -- object (which contains the previous answer's Undo data).
+                if self:_reloadScheduledBatch() then return 1 end
+                return -1 -- retry with backoff if the DB cannot be read
+            end
+        end
+    end
     local seen = {}
     for _, card in ipairs(self.cards or {}) do seen[card] = true end
     local first_new, added = nil, 0
@@ -4955,7 +4966,8 @@ end
 
 function Flashcards:_armDueWatch(delay_override)
     self:_stopDueWatch()
-    if self._closing or self.practice or self._sleep_paused then return end
+    if self._closing or self._sleep_paused then return end
+    if self.practice and not self._sync_refresh_pending then return end
     if Device.screen_saver_mode then
         self:_pauseForSleep()
         return
@@ -4965,11 +4977,15 @@ function Flashcards:_armDueWatch(delay_override)
     local in_queue = {}
     for _, c in ipairs(self.cards or {}) do in_queue[c] = true end
     local next_due = nil
+    local idle = self.state == "done" or self.state == "empty"
     for _, c in ipairs(self.all_cards or {}) do
-        if not c.done and not c._training_only and not c._retry_pending
-                and not in_queue[c] and type(c.due) == "number"
+        local next_round = idle and c.done and not self.practice
+        local pending = not self.practice and not c.done and not c._training_only and not in_queue[c]
+        if (next_round or pending) and not c._retry_pending
+                and type(c.due) == "number"
                 and cardMatches(c, self.filter, today0, yesterday0, true) then
-            if self:_isAvailableInCollection(c, now) then
+            if (next_round and c.due <= now)
+                    or (pending and self:_isAvailableInCollection(c, now)) then
                 next_due = now
                 break
             elseif next_due == nil or c.due < next_due then
@@ -4987,6 +5003,7 @@ function Flashcards:_armDueWatch(delay_override)
     elseif self.advance_today then
         next_due = now
     end
+    if self._sync_refresh_pending then next_due = now end
     if next_due == nil and delay_override == nil then return end
     local seconds = math.max(0.25, (next_due or now) - now)
     -- Retry backoff during dialogs/CRAM: never spin on an already-due card.
@@ -5000,7 +5017,9 @@ function Flashcards:_armDueWatch(delay_override)
             self:_pauseForSleep()
             return
         end
+        local sync = package.loaded["flipside_sync"]
         if self.busy or self.retry_round or self._inspection_cursor
+                or (sync and sync.running)
                 or UIManager:getTopmostVisibleWidget() ~= self then
             self:_armDueWatch(15)
             return
@@ -5016,8 +5035,14 @@ function Flashcards:_armDueWatch(delay_override)
                 self:_refresh()
             end
         end
-        self:_appendNewlyDue()
-        self:_armDueWatch()
+        if self._sync_refresh_pending then
+            if not self:_applySyncRefresh() then
+                self:_armDueWatch(15)
+                return
+            end
+        end
+        local added = self:_appendNewlyDue()
+        self:_armDueWatch(added < 0 and 15 or nil)
     end
     self._due_watch_action = action
     UIManager:scheduleIn(seconds, action)
@@ -5366,6 +5391,10 @@ function Flashcards:answer(got)
     if self.busy or self.state ~= "card" or self._inspection_cursor then
         return true
     end
+    local sync = package.loaded["flipside_sync"]
+    if (sync and sync.running) or (self._sync_refresh_pending and not self.retry_round) then
+        return true
+    end
     self:_clockPulse(false)
     self:_clockTouch()
     self.busy = true
@@ -5389,6 +5418,7 @@ function Flashcards:answer(got)
         -- Restart the official-review timer only if we returned to a native
         -- pending card. No practice seconds are added to SRS review time.
         self:_clockPulse(false)
+        self:_armDueWatch()
         return true
     end
     -- In practice mode, answers are local to this session. They must never
@@ -5582,6 +5612,8 @@ function Flashcards:undo()
     if self.busy or #self.history == 0 then
         return true
     end
+    local sync = package.loaded["flipside_sync"]
+    if self._sync_refresh_pending or (sync and sync.running) then return true end
     self.busy = true
     local last = self.history[#self.history]
     local card = self.cards[last.idx]
@@ -8095,11 +8127,12 @@ end
 ---------------------------------------------------------------- reloading
 
 -- Rebuild the deck from the database, respecting selected and active groups.
-function Flashcards:reloadDeck()
+function Flashcards:reloadDeck(fresh_deck, new_batch)
     if not self.reload_func then
         return false
     end
-    local ok, deck = pcall(self.reload_func)
+    local ok, deck = true, fresh_deck
+    if not deck then ok, deck = pcall(self.reload_func) end
     if not ok or type(deck) ~= "table" then
         logger.warn("vocab flashcards: could not reload the deck:", deck)
         return false
@@ -8116,6 +8149,11 @@ function Flashcards:reloadDeck()
     self.idx = 1
     self.history = {}
     self._browse_back = {}
+    if new_batch then
+        self.got, self.forgot = 0, 0
+        self.dual_meaning_total, self.dual_meaning_correct = 0, 0
+        self.dual_context_total, self.dual_context_correct = 0, 0
+    end
     self.retry_round = false
     self.retry_total = 0
     self.retry_seen = 0
@@ -8131,6 +8169,68 @@ function Flashcards:reloadDeck()
     self:_armDueWatch()
     self:_offerCramResetForEmptyDeck()
     return true
+end
+
+-- Read the complete SQLite catalog and refresh the hidden backing list.
+-- Do not use a partial list fallback for automatic refreshes.
+function Flashcards:_readFreshCatalog()
+    local ok, deck = pcall(readFullCatalog)
+    if not ok or type(deck) ~= "table" or not deck.full_catalog then
+        logger.warn("FlipSide live refresh: could not read catalog", deck)
+        return nil
+    end
+    return deck
+end
+
+function Flashcards:_reloadScheduledBatch()
+    local deck = self:_readFreshCatalog()
+    if not deck then return false end
+    -- Reconcile even if a sync has already moved the due date: the fresh
+    -- database snapshot, not the old session, decides the next batch.
+    if self.refresh_backing_func and not self.refresh_backing_func() then return false end
+    if not self:reloadDeck(deck, true) then return false end
+    self:_clockTouch()
+    self:_clockPulse(false)
+    return true
+end
+
+-- Compare database fields, not the temporary flags of a review session.
+function Flashcards:_sameLiveCatalog(before, after)
+    if not before or #before ~= #after then return false end
+    local by_word = {}
+    for _, c in ipairs(before) do by_word[c.word] = c end
+    for _, c in ipairs(after) do
+        local old = by_word[c.word]
+        if not old then return false end
+        for _, key in ipairs({"book", "created", "due", "reviewed", "review_count",
+                "streak_count", "prev", "next", "highlight", "never_reviewed"}) do
+            if old[key] ~= c[key] then return false end
+        end
+    end
+    return true
+end
+
+function Flashcards:_applySyncRefresh()
+    local deck = self:_readFreshCatalog()
+    if not deck then return false end
+    if self.refresh_backing_func and not self.refresh_backing_func() then return false end
+    if not self:_sameLiveCatalog(self.all_cards, deck) then
+        -- A changed authoritative catalog invalidates old pending cards and
+        -- historical Undo snapshots. Start a coherent new session, as reopen
+        -- would, rather than applying a stale answer to an imported schedule.
+        if not self:reloadDeck(deck, true) then return false end
+    elseif self.state ~= "card" then
+        -- Statistics/calendar may have changed without any card change.
+        self:_render()
+        self:_refresh()
+    end
+    self._sync_refresh_pending = nil
+    return true
+end
+
+function Flashcards:requestSyncRefresh()
+    self._sync_refresh_pending = true
+    self:_armDueWatch(0.25)
 end
 
 -- "Reload" button of the empty screen.
@@ -8531,6 +8631,11 @@ function Flash.start(w, list_is_shown, auto_opened)
         flush_func = function()
             flushToDB(ctx.list)
         end,
+        refresh_backing_func = function()
+            useFresh(liveList(ctx.list))
+            watchList(ctx.list)
+            return reloadList(ctx.list)
+        end,
         reload_func = function()
             useFresh(liveList(ctx.list))
             watchList(ctx.list)
@@ -8794,6 +8899,16 @@ end
 -- Non-destructive bridge for FlipSide's main menu: open the existing Aa
 -- appearance menu on the active flashcard screen. No new user setting.
 package.loaded["flipside_flashcards_menu_api"] = {
+    getActiveFlashcards = function(plugin)
+        local current = Flash.current
+        if current and not current._closing and UIManager:isWidgetShown(current)
+                and getPlugin() == plugin then return current end
+    end,
+    refreshAfterSync = function(plugin)
+        local current = Flash.current
+        if current and not current._closing and UIManager:isWidgetShown(current)
+                and getPlugin() == plugin then current:requestSyncRefresh() end
+    end,
     -- Only Statistics uses this reversible paint-time mask. It never edits
     -- the card, its saved context or any review/scheduling record.
     setStatisticsCenterConcealed = function(conceal)

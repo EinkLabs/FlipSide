@@ -158,7 +158,8 @@ local function withProvider(plugin, done)
             or type(provider.uploadFile)~='function' then
         done(false,'Cloud Storage provider is unavailable');return
     end
-    local widget=plugin and plugin.widget
+    local api=package.loaded["flipside_flashcards_menu_api"]
+    local widget=api and api.getActiveFlashcards and api.getActiveFlashcards(plugin)
     if widget and widget.retry_round then
         done(false,'Finish the current CRAM card before syncing; progress was not changed')
         return

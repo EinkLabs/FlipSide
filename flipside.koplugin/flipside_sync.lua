@@ -227,17 +227,6 @@ local function syncCards(plugin, done)
             os.remove(incoming)
             os.remove(staged_upload)
             if success then
-                local Device = require('device')
-                local widget = plugin.widget
-                if widget and result ~= 'Already up to date'
-                    and not Device.screen_saver_mode
-                    and UIManager:getTopmostVisibleWidget() == widget then
-                    local refreshed, refresh_err = pcall(widget.reloadItems, widget)
-                    if not refreshed then
-                        logger.warn('FlipSide: card refresh:', refresh_err)
-                        Diag.report('WARNING', 'CLOUD_SYNC_RELOAD_FAILED', {stage='cards'}, refresh_err)
-                    end
-                end
                 done(true, result)
             else
                 logger.warn('FlipSide cloud cards:', tostring(result))
@@ -306,6 +295,13 @@ function M.start(plugin, requested)
         if complete then return end
         complete=true
         M.running=false
+        -- Notify the actual flashcard screen, not the hidden backing list.
+        -- Defer drawing until all stages and the result dialog are finished.
+        local api = package.loaded["flipside_flashcards_menu_api"]
+        if api and api.refreshAfterSync then
+            local ok, err = pcall(api.refreshAfterSync, plugin)
+            if not ok then logger.warn("FlipSide: live sync refresh:", err) end
+        end
         local passed, failed, broken = 0, 0, {}
         for _, kind in ipairs(queue) do
             local r = statuses[kind]
