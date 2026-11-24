@@ -1,0 +1,178 @@
+name: Update FlipSide from ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Draft release tag (example: v1.0.1)'
+        required: true
+        type: string
+      validate_only:
+        description: 'Validate without changing source or publishing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flipside-release-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'EinkLabs/FlipSide' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      VALIDATE_ONLY: ${{ inputs.validate_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download exactly one ZIP from an unpublished draft
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || { echo "Use a version such as v1.0.1"; exit 1; }
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Tag already exists; use a new version."
+            exit 1
+          fi
+          gh release view "$VERSION" --json tagName,isDraft,assets > "$RUNNER_TEMP/draft.json"
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          draft = json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "draft.json").read_text())
+          assets = draft["assets"]
+          if not draft["isDraft"] or draft["tagName"] != os.environ["VERSION"]:
+              raise SystemExit("A matching unpublished draft is required")
+          if len(assets) != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", assets[0]["name"], re.I):
+              raise SystemExit("Attach exactly one ZIP with a simple filename")
+          if assets[0].get("size", 0) > 50 * 1024 * 1024:
+              raise SystemExit("ZIP exceeds 50 MiB")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              print("INPUT_ASSET=" + assets[0]["name"], file=env)
+          PY
+          gh release download "$VERSION" --pattern '*.zip' --output "$RUNNER_TEMP/input.zip"
+      - name: Validate ZIP and replace only flipside.koplugin
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, shutil, stat, tempfile, zipfile
+          from pathlib import PurePosixPath
+          repo = pathlib.Path.cwd()
+          plugin = repo / "flipside.koplugin"
+          allowed = {".lua", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ttf", ".otf", ".md", ".txt", ".po", ".mo"}
+          blocked = {"settings", "cache", "tests", "test", "logs", "backups", "__macosx", "data"}
+          suspect = re.compile(r"(?:password|passwd|credentials?|secrets?|tokens?|crash|\.sqlite|\.db|\.log|\.bak|\.old)", re.I)
+          keys = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:password|passwd|api_key|access_token)\s*=\s*[\"'][^\"'\r\n]{8,}[\"']", re.I)
+          with tempfile.TemporaryDirectory() as tmp, zipfile.ZipFile(pathlib.Path(os.environ["RUNNER_TEMP"]) / "input.zip") as z:
+              entries = []
+              seen = set()
+              total = 0
+              for member in z.infolist():
+                  name = member.filename
+                  p = PurePosixPath(name)
+                  mode = (member.external_attr >> 16) & 0o170000
+                  if (not name or "\\" in name or ":" in name or p.is_absolute() or ".." in p.parts
+                      or any(ord(c) < 32 for c in name) or mode not in (0, stat.S_IFREG, stat.S_IFDIR)
+                      or member.flag_bits & 1):
+                      raise SystemExit("Unsafe ZIP member")
+                  if member.is_dir():
+                      continue
+                  if p.as_posix().casefold() in seen:
+                      raise SystemExit("Duplicate ZIP member")
+                  seen.add(p.as_posix().casefold())
+                  total += member.file_size
+                  if total > 150 * 1024 * 1024 or member.file_size > 30 * 1024 * 1024 or len(seen) > 2000:
+                      raise SystemExit("ZIP exceeds safety limits")
+                  entries.append((p, member))
+              files = {p for p, _ in entries}
+              roots = {p.parent for p in files if p.name == "main.lua" and p.parent / "_meta.lua" in files}
+              preferred = {p for p in roots if p.name == "flipside.koplugin"}
+              roots = preferred or roots
+              if len(roots) != 1:
+                  raise SystemExit("Expected exactly one plugin with main.lua and _meta.lua")
+              root = roots.pop()
+              stage = pathlib.Path(tmp) / "flipside.koplugin"
+              stage.mkdir()
+              for p, member in entries:
+                  if not p.is_relative_to(root):
+                      continue
+                  rel = p.relative_to(root)
+                  if any(part.startswith(".") or part.lower() in blocked for part in rel.parts) or suspect.search(rel.name):
+                      raise SystemExit("Potential private or runtime file in plugin: " + str(rel))
+                  if rel.suffix.lower() not in allowed and rel.name not in {"COPYING", "LICENSE", "NOTICE"}:
+                      raise SystemExit("Unexpected file type: " + str(rel))
+                  data = z.read(member)
+                  if data.startswith(b"SQLite format 3") or keys.search(data):
+                      raise SystemExit("Possible private database or secret in: " + str(rel))
+                  dest = stage.joinpath(*rel.parts)
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(data)
+              # Keep existing required license/attribution if the installer omitted them.
+              for name in ("COPYING", "NOTICE.txt"):
+                  if not (stage / name).exists():
+                      shutil.copyfile(plugin / name, stage / name)
+              meta = (stage / "_meta.lua").read_text(encoding="utf-8")
+              if not re.search(r'fullname\s*=\s*["\']FlipSide["\']', meta):
+                  raise SystemExit("This is not a FlipSide installer")
+              shutil.rmtree(plugin)
+              shutil.copytree(stage, plugin)
+          PY
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends luajit
+      - name: Validate all Lua syntax and run existing regression tests
+        run: |
+          set -euo pipefail
+          find flipside.koplugin -name '*.lua' -type f -print0 | while IFS= read -r -d '' file; do
+            luajit -b "$file" "$RUNNER_TEMP/compile.luac"
+          done
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          luajit tests/run.lua
+          python3 scripts/build_release.py
+          python3 -m unittest discover -s tests -p 'test_release.py' -v
+      - name: Review changes and prepare versioned installer
+        run: |
+          set -euo pipefail
+          git add -A -- flipside.koplugin
+          git diff --cached --check
+          git diff --cached --stat
+          cp dist/FlipSide-1.0.0-rc.1.zip "$RUNNER_TEMP/FlipSide-${VERSION#v}.zip"
+          if [[ "$VALIDATE_ONLY" == "true" ]]; then
+            echo "Validation only: source and draft were not changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Publish validated source and release
+        if: inputs.validate_only == false
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --cached --quiet; then
+            git commit -m "Update FlipSide to $VERSION"
+          fi
+          # Make sure the draft still contains the same input asset.
+          gh release view "$VERSION" --json isDraft,assets,tagName > "$RUNNER_TEMP/current-draft.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          old = json.loads((root / "draft.json").read_text())
+          new = json.loads((root / "current-draft.json").read_text())
+          if new != old:
+              raise SystemExit("Draft changed during validation; run again")
+          PY
+          git tag "$VERSION"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$VERSION"
+          asset="FlipSide-${VERSION#v}.zip"
+          gh release upload "$VERSION" "$RUNNER_TEMP/$asset" --clobber
+          if [[ "$INPUT_ASSET" != "$asset" ]]; then
+            gh release delete-asset "$VERSION" "$INPUT_ASSET" --yes
+          fi
+          if [[ "$VERSION" == *-* ]]; then
+            gh release edit "$VERSION" --draft=false --prerelease=true
+          else
+            gh release edit "$VERSION" --draft=false --prerelease=false
+          fi
+          echo "Published $VERSION" >> "$GITHUB_STEP_SUMMARY"
