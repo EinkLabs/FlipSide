@@ -182,6 +182,70 @@ function M.save(word,text,dictionary)
     persist()
     return true,id,true
 end
+-- Link only word forms obtained from the SAME dictionary lookup or the
+-- actual highlighted form persisted on a card. No stemming or fuzzy match:
+-- inflection guesses could show another word's unrelated definition.
+-- Copy individual records (not a shared mutable alias), so the existing V3
+-- cloud snapshot format transports the recovered meanings unchanged.
+-- Never erase the original, overwrite a target entry, or revive a tombstone.
+function M.copyFromSelectedForm(card_word, selected_form)
+    if type(card_word)~='string' or type(selected_form)~='string' then return false end
+    local target,source=cleanWord(card_word),cleanWord(selected_form)
+    if target=='' or source=='' or target==source
+            or #target>2048 or #source>2048 then return false end
+    -- Only real selected words, not an accidental sentence used as highlight.
+    if source:find('[\r\n]') or source:find('%s') and not target:find('%s') then
+        return false
+    end
+    local source_rows=active(source)
+    if #source_rows==0 then return false end
+    local destination=bucketFor(target,true)
+    local old_count=#active(target)
+    local maxrank=0
+    for _,item in ipairs(active(target)) do
+        maxrank=math.max(maxrank,tonumber(item.rank) or 0)
+    end
+    local modified=false
+    for _,item in ipairs(source_rows) do
+        -- Legacy ids were always 'legacy', so they cannot be reused as a key
+        -- when the target already has a different legacy definition.
+        local id=item.id=='legacy' and meaningId(item.dictionary,item.text) or item.id
+        local existing=destination[id]
+        -- V1 stored deletion tombstones under the opaque 'legacy' id.
+        -- Their old text is unavailable: never infer that a deleted legacy
+        -- record may safely be recreated by a background recovery.
+        if type(destination.legacy)=='table' and destination.legacy.deleted==true then
+            existing=true
+        end
+        local duplicate=false
+        for _,row in pairs(destination) do
+            if type(row)=='table' and row.deleted~=true
+                    and row.text==item.text
+                    and cleanDictionary(row.dictionary)==item.dictionary then
+                duplicate=true
+                break
+            end
+        end
+        -- Deletion tombstones take precedence over automatic recovery.
+        -- A true hash collision is skipped instead of overwriting anything.
+        if not duplicate and not existing then
+            local rank=item.rank
+            if old_count>0 and maxrank>0 then
+                maxrank=maxrank+1
+                rank=maxrank
+            elseif rank then
+                maxrank=math.max(maxrank,rank)
+            end
+            destination[id]={text=item.text,dictionary=item.dictionary,
+                updated_at=item.updated_at,deleted=false,
+                rank=rank,rank_updated_at=item.rank_updated_at}
+            modified=true
+        end
+    end
+    if modified then persist() end
+    return modified
+end
+
 function M.update(word,id,text)
     local key=cleanWord(word)
     local b=bucketFor(key,false)
@@ -530,12 +594,30 @@ local function saveSelected(p)
         notify('Select a definition first, then tap Save.')
         return true
     end
-    local ok,err=M.save(p._flipside_meaning_word, selected,
-        p._flipside_selected_dict or p.dictionary)
+    local selected_word=p._flipside_meaning_word
+    local source=p._flipside_selected_dict or p.dictionary
+    local ok,err=M.save(selected_word,selected,source)
     if not ok then notify(err);return true end
+    -- During book reading, KOReader may select "gasped" while the card is
+    -- stored as the dictionary headword "gasp". Save to both *explicitly*
+    -- linked forms. Keep the original reading-form record for existing data.
+    local link_failed=false
+    if p._flipside_meaning_context=='reading'
+            and type(p.lookupword)=='string'
+            and cleanWord(p.lookupword)~=cleanWord(selected_word) then
+        local safe,linked,linkerr=pcall(M.save,p.lookupword,selected,source)
+        if not safe or not linked then
+            logger.warn('FlipSide meaning: card-form save failed:',safe and linkerr or linked)
+            link_failed=true
+        end
+    end
     p._flipside_selected_meaning=nil
     p._flipside_selected_dict=nil
-    notify('Meaning saved. '..tostring(M.countForWord(p._flipside_meaning_word))..' total.')
+    if link_failed then
+        notify('Meaning saved for selected word. Card link failed.')
+    else
+        notify('Meaning saved. '..tostring(M.countForWord(p._flipside_meaning_word))..' total.')
+    end
     return true
 end
 
@@ -545,7 +627,10 @@ local function attachPopup(p)
         local actual=cleanWord(p.word or p.lookupword)
         if pending_word then
             -- A FlipSide card explicitly armed this lookup.
-            if actual~='' and actual~=pending_word then return false end
+            -- Card lookups may return their inflected displayed form while
+            -- the card's stored headword is the other dictionary popup field.
+            if actual~='' and actual~=pending_word
+                    and cleanWord(p.lookupword)~=pending_word then return false end
             p._flipside_meaning_word=pending_word
             p._flipside_meaning_context='card'
             pending_word=nil

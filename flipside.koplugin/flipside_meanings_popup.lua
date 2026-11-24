@@ -1,7 +1,7 @@
 -- FlipSide saved meanings: uncluttered, theme-aware single-meaning carousel.
 -- All controls use the one saved popup font, across all words and settings.
--- The backdrop paints only behind the current dialog, never the screen.
--- It is removed on exit, without changing any card template.
+-- The saved-meaning viewer keeps the underlying card frame visible.
+-- Other meaning dialogs retain their existing card-covering backdrop.
 local Blitbuffer = require('ffi/blitbuffer')
 local ButtonDialog = require('ui/widget/buttondialog')
 local Button = require('ui/widget/button')
@@ -18,6 +18,7 @@ local VerticalSpan = require('ui/widget/verticalspan')
 local CenterContainer = require('ui/widget/container/centercontainer')
 local Widget = require('ui/widget/widget')
 local Geom = require('ui/geometry')
+local GestureRange = require('ui/gesturerange')
 local Size = require('ui/size')
 local Screen = require('device').screen
 local UIManager = require('ui/uimanager')
@@ -49,12 +50,23 @@ local function face(store, size)
     return Font:getFace('cfont',size or store.getPopupFontSize())
 end
 
--- The meaning dialog has a local, non-interactive backing layer. On a
--- FlipSide card we erase the entire *measured* ornamental frame, including
--- its protruding corners, instead of estimating the bounds of the popup.
--- Outside those rectangles the underlying page is never painted over.
+-- Meaning dialogs have a local, non-interactive backing layer. The saved
+-- definition viewer leaves the card untouched; its submenus continue to
+-- cover the measured card content and ornamental frame as before.
 local LocalBackdrop = Widget:extend{}
 function LocalBackdrop:getSize() return Screen:getSize() end
+-- Cover the *actual* card content area, not only the decorative frame.
+-- Flashcards already exposes this measured region for its floating menus;
+-- unlike the frame, it also exists for Default cards without a border.
+-- During reading (no active flashcard) this returns nil and changes nothing.
+local function activeCardContentRect()
+    local api = package.loaded['flipside_flashcards_menu_api']
+    if type(api) ~= 'table' or type(api.getMenuSafeBounds) ~= 'function' then
+        return nil
+    end
+    local ok, rect = pcall(api.getMenuSafeBounds)
+    return ok and rect or nil
+end
 local function paintClippedBox(bb, x, y, rect, inset)
     if type(rect) ~= 'table' or not rect.x or not rect.y
             or not rect.w or not rect.h then return end
@@ -70,14 +82,21 @@ end
 function LocalBackdrop:paintTo(bb,x,y)
     local sw,sh=Screen:getWidth(),Screen:getHeight()
     self.dimen=Geom:new{x=x,y=y,w=sw,h=sh}
-    if self.frame_provider then
-        local ok,frame=pcall(self.frame_provider)
-        if ok and frame then
-            -- Covers both contour strokes, outer tabs and antialiased corners.
-            paintClippedBox(bb,x,y,frame,math.max(3,Screen:scaleBySize(9)))
+    -- Only the saved-meaning viewer leaves the underlying card/frame intact.
+    -- All other meaning dialogs retain their existing opaque backdrop.
+    if not self.show_card_behind then
+        local card_rect = activeCardContentRect()
+        if card_rect then
+            paintClippedBox(bb,x,y,card_rect,0)
         end
+        if self.frame_provider then
+            local ok,frame=pcall(self.frame_provider)
+            if ok and frame then
+                paintClippedBox(bb,x,y,frame,math.max(3,Screen:scaleBySize(9)))
+            end
+        end
+        if self.box then paintClippedBox(bb,x,y,self.box,0) end
     end
-    if self.box then paintClippedBox(bb,x,y,self.box,0) end
 end
 function LocalBackdrop:onShow() UIManager:setDirty('all','ui') end
 function LocalBackdrop:onCloseWidget() UIManager:setDirty('all','ui') end
@@ -110,7 +129,7 @@ end
 
 function M.open(store, word, openDictionary, startInOptions, frame_provider)
     local state={position=1,popup=nil,shield=nil,dialog=nil,closed=false,
-                 selected=nil,list_offset=nil,fixed_top=nil}
+                 selected=nil,list_offset=nil,fixed_top=nil,navigating=false}
     local render,options,prioritize,editList,fontPicker,fontSizeMenu
 
     local function removePopup()
@@ -175,9 +194,25 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
         local offset=dialog.movable and dialog.movable._moved_offset_y or 0
         local w=math.min(sw,sz.w+2*pad)
         local h=math.min(sh,sz.h+2*pad)
-        state.shield.box={x=math.floor((sw-w)/2),
+        local previous_box=state.shield.box
+        local next_box={x=math.floor((sw-w)/2),
             y=math.floor((sh-sz.h)/2)+offset-pad,w=w,h=h}
-        UIManager:setDirty('all','ui')
+        state.shield.box=next_box
+        if state.navigating and previous_box then
+            -- The close & reopen cycle should touch only the union of both
+            -- meaning rectangles, not repaint the entire Kindle screen.
+            -- The underlying card and shield are repainted inside this small
+            -- region, cleaning up ink from a longer previous definition.
+            local x=math.max(0,math.min(previous_box.x,next_box.x))
+            local y=math.max(0,math.min(previous_box.y,next_box.y))
+            local r=math.min(sw,math.max(previous_box.x+previous_box.w,next_box.x+next_box.w))
+            local b=math.min(sh,math.max(previous_box.y+previous_box.h,next_box.y+next_box.h))
+            if r>x and b>y then
+                UIManager:setDirty('all','ui',Geom:new{x=x,y=y,w=r-x,h=b-y})
+            end
+        else
+            UIManager:setDirty('all','ui')
+        end
     end
     -- Compact menu using ButtonDialog rows instead of the fullscreen Menu.
     -- ButtonTable exposes per-item font_face: unlike Menu's internal
@@ -187,6 +222,7 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
         removeDialog()
         removePopup()
         ensureShield()
+        state.shield.show_card_behind=false
         local rows={}
         local size=math.min(26,math.max(16,store.getPopupFontSize()))
         local key=fontKey(store)
@@ -245,6 +281,11 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
                 if onBack then UIManager:nextTick(onBack) else finish() end
             end,
         }
+        -- Native ButtonDialog:close requests flashui. Keep the meaning
+        -- picker/priority/options transitions nonflashing as well.
+        dlg.onCloseWidget=function(self)
+            UIManager:setDirty(nil,function() return 'ui',self.movable.dimen end)
+        end
         state.dialog=dlg
         pinDialog(dlg)
         shieldFor(dlg)
@@ -255,13 +296,37 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
     end
     local function dictionary()
         finish()
-        if openDictionary then UIManager:nextTick(openDictionary) end
+        if not openDictionary then return end
+        -- KOReader's dictionary close callback runs after its window closes.
+        -- Reopen only the Meaning options screen that launched this lookup.
+        -- This does not affect other dictionary windows or the card itself.
+        UIManager:nextTick(function()
+            local returned=false
+            openDictionary(function()
+                if returned then return end
+                returned=true
+                UIManager:nextTick(function()
+                    if store.get(word) then
+                        M.open(store,word,openDictionary,true,frame_provider)
+                    end
+                end)
+            end)
+        end)
     end
     local function navigate(step)
+        if state.closed then return end
         local list=store.list(word)
         if #list==0 then finish();return end
-        state.position=((state.position-1+step)%#list)+1
-        render()
+        if #list==1 then return end
+        local next_position=state.position+step
+        if next_position<1 or next_position>#list then return end
+        state.position=next_position
+        -- Only this meaning-to-meaning transition suppresses KOReader's
+        -- ButtonDialog flashui close. Exiting/other dialogs behave normally.
+        state.navigating=true
+        local ok,err=pcall(render)
+        state.navigating=false
+        if not ok then error(err) end
     end
 
     -- A multiline native editor, not a one-line/compact input popup.
@@ -331,6 +396,13 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
                 if not state.closed then returnScreen(row and row.id) end
             end,
         }
+        -- KOReader's fullscreen InputDialog:onCloseWidget explicitly asks
+        -- for a full-screen flash. Match its cleanup/onClose behavior, but
+        -- redraw as ordinary UI for this one FlipSide meaning editor only.
+        dlg.onCloseWidget=function(self)
+            self:onClose()
+            UIManager:setDirty(nil,'ui')
+        end
         UIManager:show(dlg)
         if dlg.onShowKeyboard then dlg:onShowKeyboard() end
     end
@@ -456,6 +528,15 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
                             return response
                         end
                         local menu=Menu:new(opts)
+                        local native_swipe=menu.onSwipe
+                        menu.onSwipe=function(self,arg,ges)
+                            local direction=ges and ges.direction
+                            if direction~='north' and direction~='south'
+                                    and direction~='west' and direction~='east' then
+                                return true -- Never invoke stock Menu's diagonal full refresh.
+                            end
+                            return native_swipe(self,arg,ges)
+                        end
                         local onCloseWidget=menu.onCloseWidget
                         menu.onCloseWidget=function(self,...)
                             if onCloseWidget then onCloseWidget(self,...) end
@@ -524,22 +605,24 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
         removeDialog()
         removePopup()
         ensureShield()
+        state.shield.show_card_behind=true
         local sw,sh=Screen:getWidth(),Screen:getHeight()
         local total_w=math.floor(math.min(sw*.90,Screen:scaleBySize(650)))
         local inner_w=math.max(120,total_w-2*(Size.border.window+Size.padding.button)-14)
-        local arrow_w=math.max(Screen:scaleBySize(35),math.floor(inner_w*.1))
-        local text_w=inner_w-2*arrow_w
+        -- Keep definition text evenly inset from both popup borders.
+        local body_side_margin=math.max(Screen:scaleBySize(14), math.floor(inner_w*.05))
+        local text_w=math.max(80,inner_w-2*body_side_margin)
         local body_face=face(store)
         local body=TextBoxWidget:new{
             text=row.text,face=body_face,width=text_w,
-            alignment='left',justified=false,
+            alignment='center',justified=false,
         }
         local max_body_h=math.floor(sh*.53)
         if body:getSize().h>max_body_h then
             if body.free then body:free() end
             body=ScrollTextWidget:new{
                 text=row.text,face=body_face,width=text_w,height=max_body_h,
-                alignment='left',justified=false,
+                alignment='center',justified=false,
             }
         end
         local gear=Button:new{
@@ -559,26 +642,23 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
             align='center',HorizontalSpan:new{width=before},title,
             HorizontalSpan:new{width=after},gear,
         }
-        local arrows=HorizontalGroup:new{
-            align='center',
-            Button:new{text='‹',text_font_face='smalltfont',text_font_size=27,
-                width=arrow_w,bordersize=0,padding=0,callback=function() navigate(-1) end},
-            body,
-            Button:new{text='›',text_font_face='smalltfont',text_font_size=27,
-                width=arrow_w,bordersize=0,padding=0,callback=function() navigate(1) end},
-        }
-        local progress
-        if #list<=9 then
-            local dots={}
-            for n=1,#list do dots[n]=(n==state.position and '●' or '○') end
-            progress=table.concat(dots,'  ')
-        else
-            progress=tostring(state.position)..' / '..tostring(#list)
+        -- Navigate meanings by horizontal swipes; keep the existing native
+        -- ScrollTextWidget for long definitions and its vertical scrolling.
+        -- No arrow buttons or transparent touch targets remain on either side.
+        -- Restore the original filled/empty meaning-position dots.
+        -- Keep a nine-dot viewport for unusually long meaning lists so the
+        -- footer never overflows the e-ink dialog; never show a numeric count.
+        local dots={}
+        local first=math.max(1,math.min(state.position-4,#list-8))
+        local last=math.min(#list,first+8)
+        for n=first,last do
+            dots[#dots+1]=(n==state.position and '●' or '○')
         end
+        local progress=table.concat(dots,'  ')
         local footer_text=TextWidget:new{text=progress,face=face(store,14)}
         local footer=CenterContainer:new{dimen=Geom:new{w=inner_w,h=footer_text:getSize().h},footer_text}
         local spacing=math.max(4,Screen:scaleBySize(8))
-        local content=VerticalGroup:new{align='center',header,gap(spacing),arrows,gap(spacing),footer}
+        local content=VerticalGroup:new{align='center',header,gap(spacing),body,gap(spacing),footer}
         if content:getSize().h>sh*.83 then
             logger.warn('FlipSide meaning popup exceeds safe screen height')
             finish()
@@ -588,6 +668,9 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
         dialog=ButtonDialog:new{
             width=total_w,buttons={},_added_widgets={content},
             dismissable=true,use_info_style=true,info_padding=0,info_margin=0,
+            -- Use FlipSide's existing no-inversion button handler only here;
+            -- the reader's normal buttons and dictionary are untouched.
+            _vocab_no_flash_surface=true,
             tap_close_callback=function()
                 -- ButtonDialog:onClose itself removes the window after this
                 -- callback. Release the background on the following UI tick
@@ -596,6 +679,33 @@ function M.open(store, word, openDictionary, startInOptions, frame_provider)
                 UIManager:nextTick(finish)
             end,
         }
+        -- Only this dialog owns the swipe event. KOReader's ScrollTextWidget
+        -- handles north/south first, and deliberately propagates west/east
+        -- gestures up to this ButtonDialog. The gesture zone follows the actual
+        -- pinned popup bounds: no swipes on the card/background are captured.
+        dialog.ges_events.SwipeMeaning={GestureRange:new{
+            ges='swipe',
+            range=function()
+                return dialog.movable and dialog.movable.dimen
+            end,
+        }}
+        dialog.onSwipeMeaning=function(_,_,ges)
+            local direction=ges and ges.direction
+            if direction=='west' then
+                navigate(1)   -- finger to the left: next meaning
+            elseif direction=='east' then
+                navigate(-1)  -- finger to the right: previous meaning
+            end
+            -- Consume gestures in the popup at boundaries and on diagonals;
+            -- vertical scroll has already been handled by ScrollTextWidget.
+            return true
+        end
+        -- This popup must never request a flashing update, not even on
+        -- Done/outside-tap. Navigation and close use the same regional UI mode.
+        -- Scope the override to this FlipSide dialog instance only.
+        dialog.onCloseWidget=function(self)
+            UIManager:setDirty(nil,function() return 'ui',self.movable.dimen end)
+        end
         state.popup=dialog
         local actual_top=pinDialog(dialog,state.fixed_top)
         -- Keep the *first* placement for later meanings. A longer meaning

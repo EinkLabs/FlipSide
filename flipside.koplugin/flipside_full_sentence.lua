@@ -44,6 +44,59 @@ local closers = { '"', "'", ")", "]", "}", "»", "”", "’", "›", "」", "�
 -- These suffixes belong to the closing sentence: .”* Next sentence.
 local footnote_marks = {"*", "†", "‡", "⁎", "⁑", "¹", "²", "³", "⁰", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹"}
 
+-- A closing quote followed by a speech attribution is not a terminal
+-- sentence boundary: “Stop!” Harry gasped. is ONE studied utterance.
+-- Match a small, auditable set of reporting verbs rather than merging any
+-- capitalized prose after quotes (e.g., “Stop!” Harry ran. is two clauses).
+local speech_verbs = {
+    said=true, asked=true, replied=true, answered=true, responded=true,
+    shouted=true, yelled=true, cried=true, screamed=true, whispered=true,
+    muttered=true, murmured=true, mumbled=true, stammered=true,
+    stuttered=true, gasped=true, panted=true, rasped=true, wheezed=true,
+    breathed=true, hissed=true, growled=true, snarled=true, snapped=true,
+    barked=true, roared=true, bellowed=true, exclaimed=true, called=true,
+    pleaded=true, begged=true, demanded=true, protested=true, insisted=true,
+    sobbed=true, groaned=true, grunted=true, sighed=true, chuckled=true,
+    laughed=true, giggled=true, croaked=true, sneered=true, scoffed=true,
+    retorted=true, warned=true, admitted=true, confessed=true, added=true,
+    continued=true, interrupted=true, repeated=true, questioned=true,
+    quipped=true, sang=true, whimpered=true, spluttered=true, blurted=true,
+    squeaked=true, shrieked=true, drawled=true, faltered=true,
+}
+local function followedBySpeechTag(text, after)
+    -- `after` is the byte immediately following a completed closing quote.
+    local tail = text:sub(after)
+    if not tail:match("^%s+") then return false end
+    -- Never cross paragraph or sentence boundaries, even in a long excerpt.
+    local candidate = tail:match("^%s+([^%.%!%?;:\n\r]+)")
+    if not candidate then return false end
+    candidate = candidate:sub(1, 100)
+    if candidate:match("^[‘“'\"]") then return false end
+    local words = {}
+    for token in candidate:gmatch("[%a]+") do
+        words[#words + 1] = token
+        if #words == 6 then break end
+    end
+    if #words < 2 then return false end
+    local first = words[1]
+    local low_first = first:lower()
+    -- An ordinary subject (pronoun or a character's name) followed by a
+    -- reporting verb, with optional second/third name: Uncle Vernon snarled.
+    local subject = low_first == "he" or low_first == "she" or
+        low_first == "they" or low_first == "i" or low_first == "we" or
+        first:match("^[A-Z]") ~= nil
+    if subject then
+        for i = 2, math.min(#words, 4) do
+            local prev = words[i - 1]
+            -- Intermediate words must look like names, not a new sentence.
+            if i > 2 and prev:match("^[A-Z]") == nil then break end
+            if speech_verbs[words[i]:lower()] then return true end
+        end
+    end
+    -- Inverted attribution: “Stop!” whispered Harry.
+    return speech_verbs[low_first] and words[2]:match("^[A-Z]") ~= nil
+end
+
 
 -- Some document formats may hand back an object-replacement or missing-
 -- glyph marker as selected_text / highlighted_word. Never display it between
@@ -64,7 +117,11 @@ local function clean(s)
     if type(s) ~= "string" then return "" end
     -- Preserve the spaces on both sides of the selected word. Normalizing
     -- only newlines prevents line breaks from splitting a rendered sentence.
-    return (s:gsub("[%c]+", " "):gsub("%s%s+", " "))
+    -- Some EPUB engines return Unicode line/paragraph separators or NBSP
+    -- instead of an ASCII newline. Treat all of them as whitespace so a
+    -- visually blank paragraph never hides the preceding sentence.
+    return (s:gsub(" ", " "):gsub(" ", " "):gsub(" ", " ")
+        :gsub("[%c]+", " "):gsub("%s%s+", " "))
 end
 
 local function trimLeft(s) return (s:gsub("^%s+", "")) end
@@ -133,6 +190,17 @@ local function boundaryAt(text, pos)
     if not east_asian and after <= #text
         and not text:sub(after, after):match("%s") then
         return nil -- decimal, URL, embedded punctuation
+    end
+
+    -- A dialogue tag belongs to the quoted utterance, including after !/?
+    -- and when the speaker is named (Harry gasped, Uncle Vernon snarled).
+    -- Only apply this when the punctuation really has a closing quotation mark.
+    local suffix = text:sub(pos + #mark, after - 1)
+    if (suffix:find("'", 1, true) or suffix:find('"', 1, true)
+            or suffix:find("’", 1, true) or suffix:find("”", 1, true)
+            or suffix:find("»", 1, true))
+        and followedBySpeechTag(text, after) then
+        return nil
     end
 
     if mark == "." then
@@ -257,6 +325,29 @@ end
 -- incomplete fragment as the "previous" sentence. On newly shortened saved
 -- excerpts, the previous sentence begins at the start of the field; the
 -- conservative sentence-start check allows it to remain visible on reopen.
+-- A complete neighboring sentence can begin with an opening quotation
+-- mark. Lua patterns do not reliably classify UTF-8 curly quotes inside
+-- byte-based character classes; check whole prefixes explicitly instead.
+-- Never accept a lowercase mid-sentence fragment as a complete sentence.
+local sentence_openers = {"'", '"', "‘", "“", "«", "(", "[", "—", "–"}
+local function startsWithSentenceCapital(s)
+    s = trimLeft(s)
+    if s:match("^[A-Z]") then return true end
+    for _ = 1, 4 do
+        local matched = false
+        for _, opener in ipairs(sentence_openers) do
+            if s:sub(1, #opener) == opener then
+                s = trimLeft(s:sub(#opener + 1))
+                matched = true
+                break
+            end
+        end
+        if not matched then break end
+        if s:match("^[A-Z]") then return true end
+    end
+    return false
+end
+
 function Sentence.previousAndCurrentWindow(prev, selected, next)
     if prev == nil and next == nil then return nil, nil, { available = false } end
     local had_prev, had_next = prev ~= nil, next ~= nil
@@ -274,8 +365,7 @@ function Sentence.previousAndCurrentWindow(prev, selected, next)
             -- A cropped excerpt can begin mid-sentence. Never present an
             -- obviously incomplete lower-case fragment as a complete prior.
             if candidate ~= '' and not candidate:match('^%.%.%.')
-                and (candidate:match('^[A-Z]')
-                    or candidate:match('^["“‘%(]%s*[A-Z]')) then
+                and startsWithSentenceCapital(candidate) then
                 previous_sentence = candidate
             end
         end
@@ -362,6 +452,202 @@ function Sentence.format(prev, selected, next)
         end
     end
     return left .. "【" .. selected .. "】" .. right
+end
+
+-- Etapa 2: save the native reading selection before the dictionary starts its
+-- lookup. KOReader can clear the selected text while a dictionary popup stays
+-- open, so relying on it when the user eventually taps Add is not sufficient.
+-- Only a per-ReaderUI, in-memory snapshot is kept; nothing is synced or written
+-- until FlipSide's existing add-word action runs.
+local function normalizeQuery(s)
+    if type(s) ~= "string" then return nil end
+    s = s:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    return s ~= "" and s or nil
+end
+
+function Sentence.snapshotMatches(snapshot, lookup_word, highlight)
+    if type(snapshot) ~= "table" then return false end
+    if normalizeQuery(snapshot.lookup_word) ~= nil
+        and normalizeQuery(snapshot.lookup_word) == normalizeQuery(lookup_word) then
+        return true
+    end
+    -- Some dictionary results use the lemma (gasp) while the original
+    -- selected text is inflected (gasped). This snapshot is scoped to the
+    -- actual ReaderHighlight object that initiated the pending lookup.
+    -- A new lookup always invalidates the pending snapshot.
+    if type(highlight) ~= "table" or highlight ~= snapshot.source_highlight then
+        return false
+    end
+    local selected = highlight.selected_text
+    if type(selected) == "table" and type(selected.text) == "string"
+        and normalizeQuery(selected.text) == normalizeQuery(snapshot.selected) then
+        -- If XPointers exist, require the SAME selected occurrence.
+        if snapshot.pos0 and selected.pos0 ~= snapshot.pos0 then return false end
+        if snapshot.pos1 and selected.pos1 ~= snapshot.pos1 then return false end
+        return true
+    end
+    -- Selection may be cleared while a dictionary popup is open. Since
+    -- pending snapshots are replaced on every lookup, object identity is
+    -- sufficient in that case; unlike word stems, this cannot mix entries.
+    return selected == nil and snapshot.pos0 ~= nil
+end
+
+-- Some EPUBs expose the selected paragraph through getSelectedWordContext()
+-- without its preceding block. When that happens, try KOReader/CRengine's
+-- public XPointer navigation methods while the original selection is alive.
+-- This is a bounded fallback: no searching the book or changing the reading
+-- position, and no guesswork when the document cannot supply the text.
+local function recoverPreviousAcrossParagraph(highlight, native_prev)
+    local selection = highlight and highlight.selected_text
+    local doc = highlight and highlight.ui and highlight.ui.document
+    if type(selection) ~= "table" or type(selection.pos0) ~= "string"
+        or type(selection.pos1) ~= "string" or not doc
+        or type(doc.getPrevVisibleWordStart) ~= "function"
+        or type(doc.getTextFromXPointers) ~= "function" then
+        return nil
+    end
+
+    local start = selection.pos0
+    local moved = false
+    -- Bound the number of native C-engine calls: this runs only if the
+    -- default capture could not find a full preceding sentence.
+    for _ = 1, 160 do
+        local ok, prior = pcall(doc.getPrevVisibleWordStart, doc, start)
+        if not ok then break end
+        if type(prior) ~= "string" or prior == start then
+            -- The previous-word iterator can stop at an EPUB block boundary.
+            -- A preceding visible character may cross that boundary safely.
+            if type(doc.getPrevVisibleChar) ~= "function" then break end
+            ok, prior = pcall(doc.getPrevVisibleChar, doc, start)
+            if not ok or type(prior) ~= "string" or prior == start then break end
+        end
+        start = prior
+        moved = true
+    end
+    if not moved then return nil end
+
+    local ok, raw = pcall(doc.getTextFromXPointers, doc, start, selection.pos0, false)
+    -- CRengine may clear a highlighted selection when another text range is
+    -- read. Restore the original highlight exactly as KOReader itself does.
+    pcall(doc.getTextFromXPointers, doc, selection.pos0, selection.pos1, true)
+    if not ok or type(raw) ~= "string" or raw == "" or #raw > 12000 then
+        return nil
+    end
+    local candidate = clean(raw)
+    local previous = clean(native_prev)
+    if #candidate <= #previous then return nil end
+    -- Only accept continuous text immediately preceding this selected word.
+    -- In particular, never join a passage from an unrelated chapter/page.
+    local tail = trimRight(previous)
+    if tail ~= "" and trimRight(candidate):sub(-#tail) ~= tail then
+        return nil
+    end
+    return raw
+end
+
+function Sentence.captureAtLookup(highlight, lookup_word)
+    if type(highlight) ~= "table" then return nil end
+    local selected_text = highlight.selected_text
+    if type(selected_text) ~= "table" or not validSelected(selected_text.text) then return nil end
+    local selected = selected_text.text
+    local get_context = highlight.getSelectedWordContext
+    local ok, prev, next = false, nil, nil
+    if type(get_context) == "function" then
+        ok, prev, next = pcall(get_context, highlight, CONTEXT_WORDS)
+        if not ok then
+            logger.warn("FlipSide context: extended selection read failed:", prev)
+        end
+        -- Some document backends cannot supply a very large context window.
+        -- Prefer a shorter real excerpt over saving an empty sentence.
+        if not ok or (prev == nil and next == nil) then
+            for _, limit in ipairs({60, 15}) do
+                local retry_ok, p, n = pcall(get_context, highlight, limit)
+                if retry_ok and (p ~= nil or n ~= nil) then
+                    prev, next, ok = p, n, true
+                    break
+                end
+            end
+        end
+    end
+
+    -- First retain the ordinary native capture. If there is no previous
+    -- complete sentence, attempt a separate bounded XPointer lookbehind
+    -- across paragraph breaks, which may be invisible to the native window.
+    local _, _, initial = Sentence.previousAndCurrentWindow(prev, selected, next)
+    if not initial.previous_complete then
+        local recovered = recoverPreviousAcrossParagraph(highlight, prev)
+        if recovered then prev = recovered end
+    end
+    if prev == nil and next == nil then return nil end
+
+    -- Ask for a longer excerpt only when native boundaries are incomplete.
+    -- Two capped retries avoid the cost of scanning an entire chapter.
+    local _, _, info = Sentence.previousAndCurrentWindow(prev, selected, next)
+    if type(get_context) == "function" and (not info.current_complete
+        or (prev ~= nil and not info.previous_complete)) then
+        for _, limit in ipairs({480, 960}) do
+            local more_ok, p, n = pcall(get_context, highlight, limit)
+            if not more_ok or (p == nil and n == nil) or (p == prev and n == next) then break end
+            -- Don't replace a longer XPointer-recovered previous paragraph
+            -- with a shorter native excerpt during these retries.
+            local gained = false
+            if type(p) == "string" and #p > #(prev or "") then
+                prev = p
+                gained = true
+            end
+            if type(n) == "string" and #n > #(next or "") then
+                next = n
+                gained = true
+            end
+            if not gained then break end
+            local _, _, extra_info = Sentence.previousAndCurrentWindow(prev, selected, next)
+            if extra_info.current_complete
+                and (prev == nil or extra_info.previous_complete) then break end
+        end
+    end
+    -- Keep the existing two-sentence policy: previous + studied sentence.
+    -- Preserve nils instead of manufacturing context or replacing good data
+    -- with empty strings. The selected form may differ from the dictionary key.
+    local cropped_prev, cropped_next = Sentence.previousAndCurrentWindow(prev, selected, next)
+    if cropped_prev == "" then cropped_prev = nil end
+    if cropped_next == "" then cropped_next = nil end
+    if cropped_prev == nil and cropped_next == nil then return nil end
+    return {
+        lookup_word = lookup_word,
+        selected = selected,
+        source_highlight = highlight,
+        pos0 = selected_text.pos0,
+        pos1 = selected_text.pos1,
+        prev_context = cropped_prev,
+        next_context = cropped_next,
+    }
+end
+
+function Sentence.installLookupCapture(plugin, is_enabled)
+    local dictionary = plugin and plugin.ui and plugin.ui.dictionary
+    if type(dictionary) ~= "table" or dictionary._flipside_capture_installed then return false end
+    local original_lookup = dictionary.onLookupWord
+    if type(original_lookup) ~= "function" then return false end
+    dictionary._flipside_capture_installed = true
+    dictionary.onLookupWord = function(dict, word, is_sane, boxes, highlight, link, close_callback)
+        -- Every new lookup invalidates the previous pending lookup, including
+        -- a query from inside a definition (no book text selected).
+        local enabled = true
+        if type(is_enabled) == "function" then
+            local ok_enabled, result = pcall(is_enabled)
+            enabled = ok_enabled and result == true
+        end
+        local ok, snapshot = true, nil
+        if enabled and highlight then
+            ok, snapshot = pcall(Sentence.captureAtLookup, highlight, word)
+            if not ok then
+                logger.warn("FlipSide context: lookup snapshot failed:", snapshot)
+            end
+        end
+        plugin._flipside_pending_context = ok and snapshot or nil
+        return original_lookup(dict, word, is_sane, boxes, highlight, link, close_callback)
+    end
+    return true
 end
 
 -- Publish the same formatter for the flashcard patch (no extra file needed).

@@ -14,6 +14,16 @@ local M = {}
 local PagerBounds = require("lib.ui.flipside_pager_bounds")
 
 local FlashMenu = Menu:extend{}
+-- KOReader's stock Menu:onSwipe sends "full" on diagonal gestures.
+-- Keep all normal menu actions, but do not allow menu-local full refresh.
+function FlashMenu:onSwipe(arg, ges)
+    local direction = ges and ges.direction
+    if direction ~= "north" and direction ~= "south"
+            and direction ~= "west" and direction ~= "east" then
+        return true
+    end
+    return Menu.onSwipe(self, arg, ges)
+end
 local FLASH_MENU_BORDER = math.max(1, Size.border.thin)
 local FLASH_MENU_COLOR = Blitbuffer.COLOR_DARK_GRAY
 local FLASH_MENU_ROW_X = math.max(3, Screen:scaleBySize(7))

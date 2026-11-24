@@ -63,6 +63,9 @@ local subtitle_italic_face = Font:getFace("NotoSans-Italic.ttf", 12)
 local subtitle_color = Blitbuffer.COLOR_DARK_GRAY
 local dim_color = Blitbuffer.COLOR_GRAY_3
 local settings = G_reader_settings:readSetting(VocabBuilder.settings_key, {enabled = false, with_context = true})
+-- Older saved settings may lack this field. Respect an explicit false, but
+-- keep context saving ON when a previous version never created the option.
+if settings.with_context == nil then settings.with_context = true end
 -- Manual KOReader WordLookedUp belongs to the native plugin unless the
 -- independent FlipSide button is actively processing its own request.
 local flipSideManualLookup = false
@@ -370,7 +373,7 @@ function MenuDialog:onShow()
         return
     end
     UIManager:setDirty(self, function()
-        return "flashui", self[1][1].dimen -- other stock popups unchanged
+        return "ui", self[1][1].dimen -- FlipSide-owned menu: nonflashing update
     end)
 end
 
@@ -439,6 +442,7 @@ local WordInfoDialog = FocusManager:extend{
     remove_callback = nil,
     reset_callback = nil,
     update_callback = nil, -- used when duplicate word found when adding
+    refresh_context_callback = nil, -- safe, context-only repair, no SRS change
     dismissable = true, -- set to false if any button callback is required
 }
 local book_title_triangle = BD.mirroredUILayout() and " ⯇" or " ⯈"
@@ -522,6 +526,15 @@ function WordInfoDialog:init()
     }
 
     local buttons = self.update_callback and {{got_it_button, forgot_button, update_button}} or {{reset_button, remove_button}}
+    if self.refresh_context_callback then
+        table.insert(buttons, {{
+            text = "Restore context",
+            callback = function()
+                self.refresh_context_callback()
+                UIManager:close(self)
+            end,
+        }})
+    end
     if self.vocabbuilder and self.vocabbuilder.item.last_due_time then
         table.insert(buttons, {{
             text = _("Undo study status"),
@@ -649,7 +662,7 @@ end
 
 function WordInfoDialog:onShow()
     UIManager:setDirty(self, function()
-        return "flashui", self[1][1].dimen -- i.e., MovableContainer
+        return "ui", self[1][1].dimen -- FlipSide-owned word popup: nonflashing update
     end)
 end
 
@@ -1794,7 +1807,7 @@ function VocabularyBuilderWidget:reloadItems()
 end
 
 function VocabularyBuilderWidget:onShow()
-    UIManager:setDirty(self, "flashui")
+    UIManager:setDirty(self, "ui")
 end
 
 function VocabularyBuilderWidget:onNextPage()
@@ -1820,11 +1833,9 @@ function VocabularyBuilderWidget:onSwipe(arg, ges_ev)
         -- open filter
         self:onShowFilter()
     else -- diagonal swipe
-        -- trigger full refresh
-        UIManager:setDirty(nil, "full")
-        -- a long diagonal swipe may also be used for taking a screenshot,
-        -- so let it propagate
-        return false
+        -- Legacy list gesture must not initiate an extra e-ink full refresh.
+        -- The single manual refresh gesture lives in Flashcards:onSwipeCards.
+        return true
     end
 end
 
@@ -1905,6 +1916,12 @@ Item shown in main menu
 function VocabBuilder:init()
     self.ui.menu:registerToMainMenu(self)
     self:registerDictButtons()
+    -- Capture original reading text at the start of each dictionary lookup,
+    -- before KOReader may clear its selection. This affects FlipSide only.
+    local sentence = package.loaded["flipside_full_sentence_shared"]
+    if sentence and sentence.installLookupCapture then
+        sentence.installLookupCapture(self, function() return settings.with_context == true end)
+    end
     -- Register Save meaning before a dictionary lookup is created. This
     -- leaves DictQuickLookup's initialization and KOReader event path intact.
     local ok, saved = pcall(require, 'flipside_saved_meanings')
@@ -1938,6 +1955,16 @@ function VocabBuilder:registerDictButtons()
         auto_row_style_width_min_row_size = 2,
         auto_row_style_width_ratio = 0.7,
         show_func = function(dict_popup)
+            -- Bind the source selection to this specific popup when it is
+            -- built; it stays valid even if another dictionary opens later.
+            local sentence = package.loaded["flipside_full_sentence_shared"]
+            local snapshot = self._flipside_pending_context
+            if not dict_popup._flipside_context_snapshot and sentence
+                and sentence.snapshotMatches
+                and sentence.snapshotMatches(snapshot, dict_popup.word,
+                    dict_popup.highlight) then
+                dict_popup._flipside_context_snapshot = snapshot
+            end
             if settings.enabled then
                 -- words are added automatically, no need to add the button.
                 return false
@@ -1969,7 +1996,22 @@ function VocabBuilder:registerDictButtons()
                 flipSideManualLookup = true
                 local ok, result = pcall(function()
                     assert(type(handler) == "function", "FlipSide lookup handler unavailable")
-                    return handler(self, dict_popup.lookupword, book_title, true)
+                    local sentence = package.loaded["flipside_full_sentence_shared"]
+                    local capture = dict_popup._flipside_context_snapshot
+                    if not capture and sentence and sentence.snapshotMatches then
+                        local pending = self._flipside_pending_context
+                        if sentence.snapshotMatches(pending, dict_popup.word,
+                                dict_popup.highlight) then
+                            capture = pending
+                        end
+                    end
+                    if not capture and sentence and sentence.captureAtLookup then
+                        -- Last chance if the popup was built by another path.
+                        local ok_capture, fallback = pcall(sentence.captureAtLookup,
+                            dict_popup.highlight, dict_popup.word)
+                        if ok_capture then capture = fallback end
+                    end
+                    return handler(self, dict_popup.lookupword, book_title, true, capture)
                 end)
                 flipSideManualLookup = false -- always restore, even on failure
                 if not ok or result == false then
@@ -1977,6 +2019,15 @@ function VocabBuilder:registerDictButtons()
                         text = "FlipSide could not add this word: " .. tostring(result),
                     })
                     return
+                end
+                -- Recover earlier Save records made under the selected form.
+                -- Keep SRS, context and dictionary behavior completely intact.
+                if saved and saved.copyFromSelectedForm then
+                    local linked,linkerr=pcall(saved.copyFromSelectedForm,
+                        dict_popup.lookupword,dict_popup.word)
+                    if not linked then
+                        logger.warn('FlipSide meaning recovery on add failed:',linkerr)
+                    end
                 end
                 dict_popup._flipside_action_state = false
                 button:setText(_("Remove from FlipSide"), button.width)
@@ -2136,19 +2187,53 @@ end
 -- bypasses the event dispatcher and sets flipSideManualLookup explicitly.
 -- Automatic dictionary lookups are independent and still obey FlipSide's
 -- own Auto add new words setting.
-function VocabBuilder:onWordLookedUp(word, title, is_manual)
+function VocabBuilder:onWordLookedUp(word, title, is_manual, explicit_capture)
     if is_manual and not flipSideManualLookup then return false end
     if not settings.enabled and not is_manual then return end
     if self.widget and self.widget.current_lookup_word == word then return true end
     local prev_context
     local next_context
     local highlight
-    if settings.with_context and self.ui.highlight then
-        prev_context, next_context = self.ui.highlight:getSelectedWordContext(15)
-        if self.ui.highlight.selected_text and self.ui.highlight.selected_text.text then
-            highlight = util.cleanupSelectedText(self.ui.highlight.selected_text.text)
+    if settings.with_context then
+        local sentence = package.loaded["flipside_full_sentence_shared"]
+        local capture = explicit_capture
+        -- Automatic adds run during KOReader's lookup event, immediately
+        -- after our dictionary hook captured its original selection.
+        if not capture and not is_manual and sentence
+            and sentence.snapshotMatches
+            and sentence.snapshotMatches(self._flipside_pending_context, word,
+                self.ui and self.ui.highlight) then
+            capture = self._flipside_pending_context
+        end
+        if type(capture) == "table" then
+            prev_context = capture.prev_context
+            next_context = capture.next_context
+            highlight = util.cleanupSelectedText(capture.selected or "")
+        else
+            -- Restore the original FlipSide v0.1.0 reading-context capture:
+            -- request KOReader's selection context directly at addition time.
+            -- Unlike the newer fallback, don't require the selected inflection
+            -- to equal the dictionary's lemma (e.g. "running" vs "run").
+            -- This path only runs when there is no successful snapshot.
+            local reading_highlight = self.ui and self.ui.highlight
+            if reading_highlight and type(reading_highlight.getSelectedWordContext) == "function" then
+                local ok, p, n = pcall(reading_highlight.getSelectedWordContext,
+                    reading_highlight, 15)
+                if ok then
+                    prev_context, next_context = p, n
+                    local selected = reading_highlight.selected_text
+                    if selected and type(selected.text) == "string" and selected.text ~= "" then
+                        highlight = util.cleanupSelectedText(selected.text)
+                    end
+                else
+                    logger.warn("FlipSide legacy context fallback failed:", p)
+                end
+            end
         end
     end
+    if prev_context == "" then prev_context = nil end
+    if next_context == "" then next_context = nil end
+    if highlight == "" then highlight = nil end
 
     local update = function() DB:insertOrUpdate({
         book_title = title,
@@ -2160,6 +2245,34 @@ function VocabBuilder:onWordLookedUp(word, title, is_manual)
     }) end
 
     local item = DB:hasWord(word)
+    local context_refresh = nil
+    if item and settings.with_context and type(highlight) == "string"
+        and highlight ~= "" and type(item.book_title) == "string"
+        and item.book_title == title then
+        local stored_form = (type(item.highlight) == "string" and item.highlight ~= "")
+            and item.highlight or item.word
+        local function compareText(s)
+            return (type(s) == "string" and s or "")
+                :lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        end
+        local old_prev, old_next = compareText(item.prev_context), compareText(item.next_context)
+        local new_prev, new_next = compareText(prev_context), compareText(next_context)
+        -- Restore only sides that strictly extend the old excerpt; do not
+        -- discard a long saved right context when rescuing a short left one.
+        local better_prev = #new_prev > #old_prev and
+            (old_prev == "" or new_prev:sub(-#old_prev) == old_prev)
+        local better_next = #new_next > #old_next and
+            (old_next == "" or new_next:sub(1, #old_next) == old_next)
+        local same_selection = compareText(highlight) == compareText(stored_form)
+        if same_selection and (better_prev or better_next) then
+            context_refresh = function()
+                DB:updateContextOnly(word,
+                    better_prev and prev_context or nil,
+                    better_next and next_context or nil,
+                    highlight)
+            end
+        end
+    end
     if item then
         local date_str = T(_("Added on %1"), os.date("%Y-%m-%d", item.create_time))
         local time_str = T(_("Review scheduled at %1"), os.date("%Y-%m-%d %H:%M", item.due_time))
@@ -2172,6 +2285,7 @@ function VocabBuilder:onWordLookedUp(word, title, is_manual)
             prev_context = item.prev_context,
             next_context = item.next_context,
             update_callback = update,
+            refresh_context_callback = context_refresh,
             forgot_callback = function()
                 DB:gotOrForgot(item, false)
                 DB:batchUpdateItems({ item })

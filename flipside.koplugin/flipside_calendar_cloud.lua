@@ -1,7 +1,9 @@
 -- FlipSide study-calendar cloud exchange: study-day evidence ONLY.
 -- No modifications to activity_events, activity_days, streak observations,
 -- review statistics, the SRS database or the existing Learning Analysis exchange.
--- Uses the already selected Learning Analysis cloud folder/credentials.
+-- Calendar has its own optional cloud folder setting. Existing installations
+-- keep using the Statistics folder until a Calendar folder is selected.
+-- Credentials always stay with the official KOReader Cloud storage plugin.
 local UIManager=require('ui/uimanager')
 local DataStorage=require('datastorage')
 local LuaSettings=require('luasettings')
@@ -19,6 +21,7 @@ local ACTIVITY=DIR..'/vocabulary_builder_activity.sqlite3'
 local REMOTE_NAME='flipside_calendar_days_v1.json'
 local CACHE=DIR..'/flipside_calendar_sync_cache_v1.json'
 local IDENTITY=DIR..'/flipside_calendar_sync_identity_v1.lua'
+local CLOUD_SETTINGS=DIR..'/flipside_calendar_cloud_settings.lua'
 local STAGING=DIR..'/'..REMOTE_NAME
 local INCOMING=STAGING..'.incoming'
 local MAX_BYTES=2*1024*1024
@@ -137,10 +140,56 @@ function M.syncedDays()
     return Merge.remoteDays(data,id)
 end
 
+-- The dedicated Calendar selection contains only an account reference/path;
+-- it never stores cloud passwords or changes the Statistics selection.
+function M.getFolder()
+    local selection=LuaSettings:open(CLOUD_SETTINGS):readSetting('selected_folder')
+    if type(selection)=='table' and type(selection.type)=='string'
+        and type(selection.url)=='string' then
+        return selection
+    end
+    return nil
+end
+
+function M.chooseFolder(plugin,completion)
+    local audit=require('flipside_learning_audit')
+    local cs,issue=audit.getCloudService(plugin)
+    if not cs then
+        if completion then completion(false,issue) end
+        return false
+    end
+    cs:onShowCloudStorageList(function(chosen)
+        if type(chosen)~='table' or type(chosen.type)~='string'
+            or type(chosen.url)~='string' then
+            if completion then completion(false,'No folder selected') end
+            return
+        end
+        local selection={
+            type=chosen.type,name=chosen.name,address=chosen.address,
+            username=chosen.username,url=chosen.url,
+        }
+        local ok,err=pcall(function()
+            util.makePath(DIR)
+            local settings=LuaSettings:open(CLOUD_SETTINGS)
+            settings:saveSetting('selected_folder',selection)
+            settings:flush()
+        end)
+        if completion then completion(ok,ok and selection or err) end
+    end)
+    return true
+end
+
 function M.sync(plugin,done)
     local audit=require('flipside_learning_audit')
-    local cs,server,issue=audit.getCloudTransport(plugin)
-    if not server then done(false,issue or 'Learning Analysis cloud folder not configured');return end
+    local selected=M.getFolder()
+    local cs,server,issue
+    if selected then
+        cs,server,issue=audit.getCloudTransport(plugin,selected,true)
+    else
+        -- Backward compatible: never invalidate an existing cloud setup.
+        cs,server,issue=audit.getCloudTransport(plugin)
+    end
+    if not server then done(false,issue or 'Calendar cloud folder not configured');return end
     local provider=cs.providers and cs.providers[server.type]
     if not provider or type(provider.run)~='function'
             or type(provider.downloadFile)~='function'

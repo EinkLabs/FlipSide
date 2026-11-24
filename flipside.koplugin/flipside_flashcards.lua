@@ -574,6 +574,16 @@ end
 -- This is presentation only: retain MenuItem, native title/close, KOReader
 -- pagination controls, and the original selection/cancel/Done callbacks.
 local FlashMenu = Menu:extend{}
+-- KOReader's stock Menu:onSwipe sends "full" on diagonal gestures.
+-- Keep all normal menu actions, but do not allow menu-local full refresh.
+function FlashMenu:onSwipe(arg, ges)
+    local direction = ges and ges.direction
+    if direction ~= "north" and direction ~= "south"
+            and direction ~= "west" and direction ~= "east" then
+        return true
+    end
+    return Menu.onSwipe(self, arg, ges)
+end
 local FLASH_MENU_BORDER = math.max(1, Size.border.thin)
 local FLASH_MENU_COLOR = Blitbuffer.COLOR_DARK_GRAY
 local FLASH_MENU_ROW_X = math.max(3, Screen:scaleBySize(7))
@@ -2073,16 +2083,11 @@ local function copyFilter(candidate)
     return { kind = candidate.kind, book = candidate.book }
 end
 
--- The main "All books" queue excludes the dedicated daily and never-
--- reviewed pools. This predicate is shared by both the card list and counts.
--- Unknown creation dates are treated conservatively (still eligible) unless
--- the actual database explicitly marks the word as never reviewed.
+-- "All books" must mean ALL saved words, including cards added today,
+-- yesterday, and cards never reviewed. Due-time eligibility is evaluated
+-- separately by _isReviewEligible() and is never hidden by a date filter.
+-- The Today/Yesterday/Never Reviewed collections remain independent views.
 local function inAllBooks(card, today0, yest0)
-    if card.never_reviewed == true then return false end
-    local created = card.created
-    if created and (created >= today0 or (created >= yest0 and created < today0)) then
-        return false
-    end
     return true
 end
 
@@ -2106,6 +2111,17 @@ local function cardMatches(card, filter, today0, yest0, include_answered)
         return card.book == filter.book
     end
     return true
+end
+
+-- Cram used the older All books membership, which excluded freshly
+-- added and never-reviewed entries. Keep that old rule only for Cram;
+-- it must not hide real SRS reviews in the ordinary All books queue.
+local function cramCardMatches(card, filter, today0, yesterday0, include_answered)
+    if filter.kind == "all" then
+        if card.never_reviewed == true then return false end
+        if card.created and card.created >= yesterday0 then return false end
+    end
+    return cardMatches(card, filter, today0, yesterday0, include_answered)
 end
 
 ---------------------------------------------------------------- word dates
@@ -3501,6 +3517,12 @@ function Flashcards:_buildReviewCompletePanel(available_width, available_height)
     table.insert(panel, textLine(details.saved .. (details.saved == 1 and " saved word" or " saved words")))
     table.insert(panel, textLine("Still due today: " .. details.due .. (details.due == "1" and " card" or " cards")))
     table.insert(panel, textLine("Next review: " .. details.next_review))
+    -- These are display-only summaries of the existing native due dates.
+    if details.missed_review then table.insert(panel, textLine(details.missed_review)) end
+    if details.correct_review then table.insert(panel, textLine(details.correct_review)) end
+    if details.other_review then table.insert(panel, textLine(details.other_review)) end
+    if details.due_now then table.insert(panel, textLine(details.due_now)) end
+    if details.session_reviews then table.insert(panel, textLine(details.session_reviews)) end
     if self.retry_seen > 0 then
         table.insert(panel, textLine(string.format(
             "%s: %d practice attempts (%d correct, %d missed)",
@@ -3709,11 +3731,14 @@ function Flashcards:_render()
         -- Mode names remain in settings/statistics, never on the card itself.
         addCardGap()
         if self.dual_phase == "sentence" then
-            -- Third, per-card style: a single sentence with the original
-            -- highlighted inflection in 【brackets】. No isolated headword,
-            -- no reveal state, and the existing Forgot / Got it actions.
+            -- Sentence Card shows its saved sentence immediately, and can
+            -- independently expand/collapse the saved surrounding excerpt.
+            -- This affects the displayed text only, never answer/SRS state.
+            local source_text = self.show_more_ctx
+                and (buildSurrounding(card) or buildSentence(card))
+                or buildSentence(card)
             local sentence = Flash.protectSelectedBrackets(
-                revealSelectedWord(buildSentence(card)))
+                revealSelectedWord(source_text))
             sentence_spec = {
                 text = sentence or _("No saved context for this word."),
                 font_size = Flash.fitUnbreakableToken(self.sentence_font,
@@ -4615,6 +4640,17 @@ function Flashcards:_render()
         table.insert(root, filter_bar)
         if mode_row then table.insert(root, mode_row) end
     end
+    -- Statistics hides ONLY the card center while its modal is open.
+    -- Leave the native header, collection controls and review buttons painted.
+    -- This is a visual mask; it does not change the card or its review state.
+    local paint_card_center = center.paintTo
+    center.paintTo = function(widget, bb, x, y)
+        if self._flipside_statistics_conceal_center then
+            bb:paintRect(x, y, screen_w, center_h, Blitbuffer.COLOR_WHITE)
+            return
+        end
+        return paint_card_center(widget, bb, x, y)
+    end
     table.insert(root, center)
     table.insert(root, controls)
     self[1] = FrameContainer:new{
@@ -4631,14 +4667,16 @@ function Flashcards:_render()
     end
 end
 
-function Flashcards:_refresh(full)
+function Flashcards:_refresh()
     if self._closing then return end
     if self._sleep_paused or Device.screen_saver_mode then
         SleepTrace.blocked("refresh", UIManager, Device, self)
         return
     end
+    -- No automatic e-ink flash, including style or immersive-mode changes.
+    -- The only explicit full refresh is the top-right downward swipe gesture.
     UIManager:setDirty(self, function()
-        return full and "full" or "ui", self.dimen
+        return "ui", self.dimen
     end)
 end
 
@@ -4658,7 +4696,7 @@ function Flashcards:cycleCardStyle()
     G_reader_settings:saveSetting(Flash.CARD_STYLE_SETTING, self.card_style)
     G_reader_settings:flush()
     self:_render()
-    self:_refresh(true)
+    self:_refresh()
     return true
 end
 
@@ -4667,7 +4705,7 @@ function Flashcards:setImmersion(enabled)
     if self.immersive == enabled then return true end
     self.immersive = enabled
     self:_render()
-    self:_refresh(true)
+    self:_refresh()
     -- No extra button, toast or other distraction in either state.
     -- Hold the X in normal mode to enter; hold its former corner to exit.
     return true
@@ -4692,7 +4730,6 @@ end
 
 function Flashcards:toggleSurrounding()
     if self.state ~= "card" or self.busy then return true end
-    if self.dual_phase == "sentence" then return true end
     -- All modes can expand the captured context. In contextual cloze mode
     -- the selected word stays masked by _render(), avoiding answer leaks.
     self.show_ctx = true
@@ -4866,14 +4903,10 @@ function Flashcards:stepCard(direction)
     return true
 end
 
--- The due queue is a snapshot taken on opening, explicit Reload, filter
--- selection, or Advance Today toggle. Scheduled cards that become due later
--- do NOT enter an active session. This also prevents a just-forgotten word
--- from silently increasing the current queue five minutes later.
---
--- Keep a lightweight day-boundary check ONLY for Advance Today. The user can
--- still disable it at any time; its choice never carries into a new day.
--- Reuse the existing method names for all KOReader lifecycle call sites.
+-- A time-based due watcher for cards ALREADY present in the catalog.
+-- No polling: use a single KOReader timer set for the next real SRS due date
+-- or the midnight deadline for Advance Today. Unlike reloadDeck(), this
+-- inserts cards without replacing the current card, Undo history, or CRAM.
 function Flashcards:_stopDueWatch()
     if self._due_watch_action then
         UIManager:unschedule(self._due_watch_action)
@@ -4881,21 +4914,83 @@ function Flashcards:_stopDueWatch()
     end
 end
 
+-- Appending is deliberately narrow: a reviewed card is never reintroduced
+-- into its own session, which would make the existing Undo index ambiguous.
+-- Newly matured unreviewed cards remain eligible and need no SRS writes.
+function Flashcards:_appendNewlyDue()
+    if self.practice or self._closing or self.retry_round
+            or self.busy or self._inspection_cursor then return 0 end
+    local now = os.time()
+    local t0, y0 = dayStart(0), dayStart(1)
+    local seen = {}
+    for _, card in ipairs(self.cards or {}) do seen[card] = true end
+    local first_new, added = nil, 0
+    for _, card in ipairs(self.all_cards or {}) do
+        if not card.done and not card._training_only and not card._retry_pending
+                and not seen[card]
+                and cardMatches(card, self.filter, t0, y0, true)
+                and self:_isAvailableInCollection(card, now) then
+            self.cards[#self.cards + 1] = card
+            seen[card] = true
+            first_new = first_new or #self.cards
+            added = added + 1
+        end
+    end
+    if added > 0 then
+        logger.info("FlipSide due watcher: appended", added, "new due cards")
+        -- Never disrupt a live card or a live answer. The header is updated
+        -- on the next ordinary _render(); only an empty/finished screen
+        -- needs to become a review card immediately.
+        if self.state == "empty" or self.state == "done" then
+            self.idx = first_new
+            self.state = "card"
+            self.show_ctx, self.show_more_ctx = false, false
+            self:_resetDualCard()
+            self:_render()
+            self:_refresh()
+        end
+    end
+    return added
+end
+
 function Flashcards:_armDueWatch(delay_override)
     self:_stopDueWatch()
-    if self._closing or not self.advance_today or self.practice
-            or self._sleep_paused then return end
+    if self._closing or self.practice or self._sleep_paused then return end
     if Device.screen_saver_mode then
         self:_pauseForSleep()
         return
     end
-    -- No due-time scans, DB queries, or card insertion in a running session.
-    -- Normally schedule just once for local midnight (not every 30 seconds).
-    local seconds = self.advance_day == localDayKey()
-        and math.max(1, dayStart(-1) - os.time() + 1) or 1
-    if delay_override then
-        seconds = math.min(seconds, math.max(0.1, delay_override))
+    local now = os.time()
+    local today0, yesterday0 = dayStart(0), dayStart(1)
+    local in_queue = {}
+    for _, c in ipairs(self.cards or {}) do in_queue[c] = true end
+    local next_due = nil
+    for _, c in ipairs(self.all_cards or {}) do
+        if not c.done and not c._training_only and not c._retry_pending
+                and not in_queue[c] and type(c.due) == "number"
+                and cardMatches(c, self.filter, today0, yesterday0, true) then
+            if self:_isAvailableInCollection(c, now) then
+                next_due = now
+                break
+            elseif next_due == nil or c.due < next_due then
+                next_due = c.due
+            end
+        end
     end
+    -- Expire Advance Today at midnight even when no card is due. Keep its
+    -- original toggle persistence and day-specific behavior unchanged.
+    if self.advance_today and self.advance_day == localDayKey() then
+        local midnight = dayStart(-1) + 1
+        if next_due == nil or midnight < next_due then
+            next_due = midnight
+        end
+    elseif self.advance_today then
+        next_due = now
+    end
+    if next_due == nil and delay_override == nil then return end
+    local seconds = math.max(0.25, (next_due or now) - now)
+    -- Retry backoff during dialogs/CRAM: never spin on an already-due card.
+    if delay_override ~= nil then seconds = math.max(0.25, delay_override) end
     local action
     action = function()
         if self._due_watch_action ~= action then return end
@@ -4905,27 +5000,23 @@ function Flashcards:_armDueWatch(delay_override)
             self:_pauseForSleep()
             return
         end
-        if self.advance_today and self.advance_day ~= localDayKey() then
-            -- Do not replace the current card or force a transition while a
-            -- dictionary, menu or reinforcement round is being displayed.
-            if not self.busy and not self.retry_round
-                    and UIManager:getTopmostVisibleWidget() == self then
-                -- Expire only the day's toggle. Rebuilding here would import
-                -- newly-matured reviews and break the frozen session queue.
-                -- All Advance Today candidates were due before midnight,
-                -- so their existing session entries remain valid.
-                self.advance_today = false
-                self.advance_day = localDayKey()
-                saveAdvanceToday(false)
-                self:_render()
-                self:_refresh()
-                return
-            end
-            -- The eligibility predicate is already day-scoped; this delayed
-            -- visual reset only waits for a safe foreground opportunity.
-            self:_armDueWatch(60)
+        if self.busy or self.retry_round or self._inspection_cursor
+                or UIManager:getTopmostVisibleWidget() ~= self then
+            self:_armDueWatch(15)
             return
         end
+        if self.advance_today and self.advance_day ~= localDayKey() then
+            self.advance_today = false
+            self.advance_day = localDayKey()
+            saveAdvanceToday(false)
+            -- Do not rebuild the active/answered cards or erase history.
+            -- Newly due cards are appended by the normal watcher below.
+            if self.state ~= "card" then
+                self:_render()
+                self:_refresh()
+            end
+        end
+        self:_appendNewlyDue()
         self:_armDueWatch()
     end
     self._due_watch_action = action
@@ -5030,7 +5121,7 @@ function Flashcards:_initializeIntensive()
         local today0, yesterday0 = dayStart(0), dayStart(1)
         for _, word in ipairs(recentRecurringErrors()) do
             local card = cards_by_word[word]
-            if card and cardMatches(card, self.filter, today0, yesterday0, true) then
+            if card and cramCardMatches(card, self.filter, today0, yesterday0, true) then
                 if in_view[word] and not card.done then
                     -- Wait for first real review if the word is due now.
                     self._ultra_waiting[word] = true
@@ -5052,7 +5143,7 @@ function Flashcards:_cramApplicableFilters(card)
     local filters = {}
     local today0, yesterday0 = dayStart(0), dayStart(1)
     local function include(filter)
-        if cardMatches(card, filter, today0, yesterday0, true) then
+        if cramCardMatches(card, filter, today0, yesterday0, true) then
             filters[#filters+1] = filter
         end
     end
@@ -5071,7 +5162,9 @@ function Flashcards:_cramApplicableFilters(card)
         for _, filter in ipairs(filters) do
             if CramStore.key("intensive", filter) == requested then found=true; break end
         end
-        if not found then filters[#filters+1] = self.filter end
+        if not found and cramCardMatches(card, self.filter, today0, yesterday0, true) then
+            filters[#filters+1] = self.filter
+        end
     end
     return filters
 end
@@ -5423,6 +5516,9 @@ function Flashcards:answer(got)
     -- Start a new interval for the next genuine review immediately; the
     -- preceding rating may have changed the model or ended the due queue.
     self:_clockPulse(false)
+    -- A native answer may have moved the next maturity earlier. Rearm the
+    -- one-shot watcher without touching the committed SRS schedule.
+    self:_armDueWatch()
     return true
 end
 
@@ -5592,6 +5688,7 @@ function Flashcards:undo()
     self:_render()
     self:_refresh()
     self.busy = false
+    self:_armDueWatch()
     return true
 end
 
@@ -5787,6 +5884,22 @@ function Flashcards:_isReviewEligible(card, now)
         or false
 end
 
+-- Initial reviews are available immediately ONLY in the four collection
+-- shortcuts. This bypasses the initial 5-minute *visibility* wait, but never
+-- writes due_time or changes subsequent native SRS intervals. Book-specific
+-- filters still use the existing due-time rules.
+local function isImmediateFirstReview(card, filter)
+    local kind = filter and filter.kind
+    return card.never_reviewed == true
+        and (kind == "all" or kind == "today" or kind == "yesterday"
+            or kind == "never_reviewed")
+end
+
+function Flashcards:_isAvailableInCollection(card, now)
+    return self:_isReviewEligible(card, now)
+        or isImmediateFirstReview(card, self.filter)
+end
+
 -- Count only the additional mature cards advanced in this collection. Also
 -- count protected learning cards due later today, for the compact explanation
 -- in the same menu. Count and eligibility share one exact predicate.
@@ -5818,13 +5931,7 @@ function Flashcards:_buildView()
     local view = {}
     for _, c in ipairs(self.all_cards or {}) do
         if cardMatches(c, self.filter, today0, yest0)
-                and (self.practice
-                    -- Never Reviewed has its own explicit first-review shortcut
-                    -- in normal mode. With Advance Today enabled, honor the
-                    -- protected learning dates in every collection instead.
-                    or (self.filter.kind == "never_reviewed"
-                        and not self.advance_today)
-                    or self:_isReviewEligible(c, now)) then
+                and (self.practice or self:_isAvailableInCollection(c, now)) then
             table.insert(view, c)
         end
     end
@@ -5847,7 +5954,11 @@ function Flashcards:_filterOptions()
         local pending = not c.done and not c._retry_pending
             and not c._training_only and (self.practice
                 or self:_isReviewEligible(c, now))
-        if pending then
+        -- The top four collections expose never-reviewed words instantly.
+        -- A later, already-reviewed card remains hidden until its SRS due.
+        local first = not c.done and not c._retry_pending
+            and not c._training_only and c.never_reviewed == true
+        if pending or first then
             if inAllBooks(c, today0, yest0) then
                 all_n = all_n + 1
             end
@@ -5922,11 +6033,85 @@ function Flashcards:_completionDetails()
         end)
         if success then upcoming = stamp end
     end
-    if upcoming then
-        local now = os.time()
-        result.next_review = (os.date("%Y-%m-%d", upcoming) == os.date("%Y-%m-%d", now))
-            and os.date("%H:%M", upcoming)
-            or os.date("%d %b %H:%M", upcoming)
+    local now = os.time()
+    local function timeLabel(stamp)
+        if not stamp then return nil end
+        return (os.date("%Y-%m-%d", stamp) == os.date("%Y-%m-%d", now))
+            and os.date("%H:%M", stamp) or os.date("%d %b %H:%M", stamp)
+    end
+    if upcoming then result.next_review = timeLabel(upcoming) end
+
+    -- The completion panel must distinguish the latest REAL answer for each
+    -- word. A retry in Intensive/Practice never changes its native due date,
+    -- and an Undo removes the matching entry from this official history.
+    local last_answer = {}
+    for _, record in ipairs(self.history or {}) do
+        local card = self.cards and self.cards[record.idx]
+        if card and type(card.word) == "string" then
+            last_answer[card.word] = record.got and "correct" or "missed"
+        end
+    end
+
+    -- Read the entire real schedule, not just MIN(due_time). That aggregate
+    -- provides no way to show the separate 5-minute missed-card reviews.
+    -- This is a read-only query: no rating, database, or SRS behavior changes.
+    local read_ok, rows = pcall(function()
+        local SQ3 = require("lua-ljsqlite3/init")
+        local conn = SQ3.open(DataStorage:getSettingsDir()
+            .. "/flipside/vocabulary_builder.sqlite3")
+        local query_ok, values = pcall(conn.exec, conn,
+            "SELECT word, due_time FROM vocabulary WHERE due_time IS NOT NULL;")
+        pcall(conn.close, conn)
+        if not query_ok then error(values) end
+        return values
+    end)
+    if read_ok and type(rows) == "table" and type(rows.word) == "table" then
+        local buckets = {
+            missed = {count=0, due_now=0},
+            correct = {count=0, due_now=0},
+            other = {count=0, due_now=0},
+        }
+        local due_now, next_any = 0, nil
+        for i, word in ipairs(rows.word) do
+            local due = tonumber(rows.due_time and rows.due_time[i])
+            if type(word) == "string" and due then
+                local bucket = buckets[last_answer[word] or "other"]
+                bucket.count = bucket.count + 1
+                if due <= now then
+                    bucket.due_now = bucket.due_now + 1
+                    due_now = due_now + 1
+                else
+                    if not bucket.next or due < bucket.next then bucket.next = due end
+                    if not next_any or due < next_any then next_any = due end
+                end
+            end
+        end
+        -- The nearest review includes EVERY category, irrespective of the
+        -- book currently selected or whether its last answer was correct.
+        if next_any then result.next_review = timeLabel(next_any) end
+        local function categoryLabel(name, bucket, show_count)
+            if bucket.count == 0 then return nil end
+            local next_text = bucket.due_now > 0 and "due now"
+                or timeLabel(bucket.next)
+            if not next_text then return nil end
+            if show_count then
+                return name .. ": " .. bucket.count .. " · next " .. next_text
+            end
+            return name .. ": next " .. next_text
+        end
+        result.missed_review = categoryLabel("Missed", buckets.missed, true)
+        result.correct_review = categoryLabel("Correct", buckets.correct, true)
+        result.other_review = categoryLabel("Other reviews", buckets.other, false)
+        if due_now > 0 then
+            result.due_now = "Due now: " .. due_now
+                .. (due_now == 1 and " card" or " cards")
+        end
+    elseif not read_ok then
+        logger.warn("vocab flashcards: completion schedule breakdown unavailable:", rows)
+    end
+    local correct, missed = tonumber(self.got) or 0, tonumber(self.forgot) or 0
+    if correct + missed > 0 then
+        result.session_reviews = string.format("This session: %d correct, %d missed", correct, missed)
     end
     return result
 end
@@ -6278,7 +6463,7 @@ function Flashcards:_cramAvailableCounts()
     local waiting, in_filter = 0, 0
     for _, word in ipairs(recurring) do
         local card = cards_by_word[word]
-        if card and cardMatches(card, self.filter, today0, yesterday0, true) then
+        if card and cramCardMatches(card, self.filter, today0, yesterday0, true) then
             in_filter = in_filter + 1
             if not self.practice and in_view[word] and not card.done then
                 waiting = waiting + 1
@@ -6304,7 +6489,7 @@ function Flashcards:_cramAvailableCounts()
         if mode == "ultra" then
             for _, word in ipairs(recurring) do
                 local card = cards_by_word[word]
-                if card and cardMatches(card, self.filter,
+                if card and cramCardMatches(card, self.filter,
                         today0, yesterday0, true) then
                     -- This is a READ-ONLY preview: count the ones waiting
                     -- for an official review too, without adding them to
@@ -6978,6 +7163,11 @@ function Flashcards:showSavedMeanings()
     if self.busy then return true end
     local card=self.cards and self.cards[self.idx]
     local word=card and card.word
+    if card and word==card.word and card.highlight then
+        local ok,err=pcall(Flash.saved_meanings.copyFromSelectedForm,
+            card.word,card.highlight)
+        if not ok then logger.warn('FlipSide saved meaning menu recovery:',err) end
+    end
     local current=word and Flash.saved_meanings.get(word)
     local item_table={
         {text='Saved meanings', mandatory=tostring(Flash.saved_meanings.countMeanings())..' definitions / '..tostring(Flash.saved_meanings.count())..' words', saved_info=true},
@@ -7006,7 +7196,7 @@ function Flashcards:showSavedMeanings()
                     if UIManager:isWidgetShown(self) then self:showSyncComponent('dictionary') end
                 end)
             elseif item.saved_view then
-                if current then Flash.saved_meanings.showPopup(word,function() self:lookupWord(true) end,
+                if current then Flash.saved_meanings.showPopup(word,function(on_close) self:lookupWord(true,on_close) end,
                     function() return self._flipside_meaning_frame end)
                 else UIManager:show(newFlashInfo(self,{text='No meaning saved for this card.',timeout=3})) end
             elseif item.saved_edit then
@@ -7028,13 +7218,13 @@ function Flashcards:showSavedMeanings()
     return true
 end
 
--- Independent cloud folders. The main Cloud sync button and one Sync all
--- gesture execute exactly the same four-stage coordinator. This page only
--- configures/selectively syncs the four distinct, isolated transports.
+-- Sync settings for the existing six cloud stages. Calendar can select its
+-- own folder without changing Statistics; no other component is modified.
 local SYNC_COMPONENTS = {
     {key = "cards", title = "Flashcards"},
     {key = "cram", title = "CRAM"},
     {key = "audit", title = "Statistics"},
+    {key = "calendar", title = "Calendar"},
     {key = "dictionary", title = "Dictionary"},
     {key = "meanings", title = "Saved meanings"},
 }
@@ -7050,6 +7240,20 @@ local function syncFolderLabel(kind)
         local audit = package.loaded["flipside_learning_audit"]
         if type(audit) == "table" and type(audit.getFolder) == "function" then
             folder = audit.getFolder()
+        end
+    elseif kind == "calendar" then
+        folder = require("flipside_calendar_cloud").getFolder()
+        if not folder then
+            -- Before a separate folder is chosen, Calendar still uses the
+            -- existing Statistics folder so older setups keep working.
+            local audit = package.loaded["flipside_learning_audit"]
+            if type(audit) == "table" and type(audit.getFolder) == "function" then
+                local inherited = audit.getFolder()
+                if type(inherited) == "table" and type(inherited.type) == "string"
+                        and type(inherited.url) == "string" then
+                    return "Statistics: " .. tostring(inherited.name or inherited.type)
+                end
+            end
         end
     elseif kind == "dictionary" or kind == "meanings" then
         folder = require("flipside_dictionary_locks").getFolder()
@@ -7094,7 +7298,8 @@ end
 function Flashcards:showSyncComponent(kind)
     if self.busy then return true end
     local names = {cards = "Flashcards", cram = "CRAM",
-        audit = "Statistics", dictionary = "Dictionary", meanings = "Saved meanings"}
+        audit = "Statistics", calendar = "Calendar",
+        dictionary = "Dictionary", meanings = "Saved meanings"}
     if not names[kind] then return self:showSyncSettings() end
     local menu
     menu = newFlashMenu(self, {
@@ -7152,6 +7357,9 @@ function Flashcards:showSyncComponent(kind)
                                 error("Learning Analysis is unavailable; check crash.log")
                             end
                             return audit.chooseFolder(plugin,
+                                function(success) reopened(success) end)
+                        elseif kind == "calendar" then
+                            return require("flipside_calendar_cloud").chooseFolder(plugin,
                                 function(success) reopened(success) end)
                         end
                         local cs = plugin.ui and plugin.ui.cloudstorage
@@ -7224,7 +7432,7 @@ function Flashcards:showCardStyles()
                     G_reader_settings:saveSetting(Flash.CARD_STYLE_SETTING, self.card_style)
                     G_reader_settings:flush()
                     self:_render()
-                    self:_refresh(true)
+                    self:_refresh()
                 end
                 menu.item_table = populate()
                 menu:updateItems(menu.page)
@@ -7680,15 +7888,20 @@ end
 ---------------------------------------------------------------- dictionary
 
 -- Same as tapping the word in the list view.
-function Flashcards:lookupWord(force_dictionary)
+function Flashcards:lookupWord(force_dictionary, dictionary_close_callback)
     if self.state ~= "card" or not self.lookup_func then
         return true
     end
     self:_clockPause()
     local card = self.cards[self.idx]
+    if card and card.highlight then
+        local ok,err=pcall(Flash.saved_meanings.copyFromSelectedForm,
+            card.word,card.highlight)
+        if not ok then logger.warn('FlipSide saved meaning card recovery:',err) end
+    end
     if not force_dictionary and Flash.saved_meanings.get(card.word) then
-        return Flash.saved_meanings.showPopup(card.word, function()
-            self:lookupWord(true)
+        return Flash.saved_meanings.showPopup(card.word, function(on_close)
+            self:lookupWord(true, on_close)
         end, function() return self._flipside_meaning_frame end)
     end
     -- Idempotent fallback for KOReader builds where the owning plugin's
@@ -7699,7 +7912,20 @@ function Flashcards:lookupWord(force_dictionary)
         Flash.saved_meanings.registerDictionaryButton(reader.dictionary)
     end
     Flash.saved_meanings.arm(card.word)
-    local ok, done = pcall(self.lookup_func, card)
+    local on_close
+    if type(dictionary_close_callback) == "function" then
+        -- Only the Meaning options -> Dictionary path requests a return.
+        -- If the card was closed or changed meanwhile, do not resurrect it.
+        local opening_card = card
+        on_close = function()
+            if self.state == "card" and not self._closing
+                    and UIManager:isWidgetShown(self)
+                    and self.cards[self.idx] == opening_card then
+                dictionary_close_callback()
+            end
+        end
+    end
+    local ok, done = pcall(self.lookup_func, card, on_close)
     if not ok or not done then
         Flash.saved_meanings.disarm()
         logger.warn("vocab flashcards: dictionary lookup failed:", ok and "no handler" or done)
@@ -7802,10 +8028,10 @@ function Flashcards:onHoldCard(_arg, ges)
     return self:lookupWord()
 end
 
--- A double tap on any part of the flashcards screen reveals/hides all
--- saved context. In Meaning Recall, the isolated word remains a dictionary
--- hotspot; contextual cards use a long hold for dictionary lookup.
--- This deliberately works beyond card_rect, including empty screen margins.
+-- A double tap on the card reveals/hides saved context in ALL models.
+-- KOReader defers a single tap while double-tap detection is enabled, so a
+-- double tap on the Meaning Recall word must NOT open the dictionary.
+-- A single tap on that word still uses the native dictionary hotspot.
 function Flashcards:onDoubleTapCard(_arg, ges)
     if self.immersive and ges and ges.pos and self.immersion_exit_rect
             and ges.pos:intersectWith(self.immersion_exit_rect) then
@@ -7815,14 +8041,9 @@ function Flashcards:onDoubleTapCard(_arg, ges)
         return false
     end
     self:_clockTouch()
-    -- Single-tap on the revealed word still opens the dictionary. Double
-    -- tap anywhere on a contextual card, including the word, toggles the
-    -- entire saved context instead of opening a dictionary pop-up.
-    if self.dual_phase ~= "cloze" and self.dual_phase ~= "revealed"
-            and self.dual_phase ~= "sentence"
-            and self.word_rect and ges.pos:intersectWith(self.word_rect) then
-        return self:lookupWord()
-    end
+    -- Original v0.1.0 behavior: show/hide the recorded full context.
+    -- One deliberate deviation: a double tap on the MRO headword must
+    -- also expand context, as explicitly requested for every model.
     return self:toggleSurrounding()
 end
 
@@ -8282,7 +8503,18 @@ function Flash.start(w, list_is_shown, auto_opened)
             end
             return false, e
         end,
-        lookup_func = function(card)
+        lookup_func = function(card, on_close)
+            -- The native KOReader LookupWord event supports a dedicated
+            -- dictionary-close callback. Use it only for Meaning options;
+            -- ordinary card lookups retain their original list callback.
+            if type(on_close) == "function" then
+                local ui = getUI()
+                if not ui or not ui.dictionary then return false end
+                ctx.list.current_lookup_word = card.word
+                ui:handleEvent(Event:new("LookupWord", card.word, true,
+                    nil, nil, nil, on_close))
+                return true
+            end
             -- same call the list makes when the word is tapped
             local row = findRow(ctx.list, card)
             if row and type(row.item) == "table" and type(row.item.callback) == "function" then
@@ -8562,6 +8794,20 @@ end
 -- Non-destructive bridge for FlipSide's main menu: open the existing Aa
 -- appearance menu on the active flashcard screen. No new user setting.
 package.loaded["flipside_flashcards_menu_api"] = {
+    -- Only Statistics uses this reversible paint-time mask. It never edits
+    -- the card, its saved context or any review/scheduling record.
+    setStatisticsCenterConcealed = function(conceal)
+        local current = Flash.current
+        if not current or current._closing or not UIManager:isWidgetShown(current) then
+            return false
+        end
+        local next_state = conceal == true
+        if current._flipside_statistics_conceal_center ~= next_state then
+            current._flipside_statistics_conceal_center = next_state
+            current:_refresh()
+        end
+        return true
+    end,
     -- Scoped to existing modal dialogs; no review, SRS or data mutation.
     -- A depth counter also keeps the background hidden while dialogs are
     -- replaced (for example when changing the Study Calendar view).

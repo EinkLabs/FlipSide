@@ -1312,6 +1312,18 @@ local function minimalText(text)
     return widget
 end
 
+-- KOReader v2026.07.2 ButtonDialog:onCloseWidget() queues "flashui".
+-- Override ONLY the calendar/statistics ButtonDialog instances: the native
+-- method does nothing else besides requesting a flashing repaint.
+-- All callbacks (tap-outside, menu navigation, recording) remain native.
+package.loaded["flipside_audit_style"].closeDialogWithoutFlash = function(dialog)
+    dialog.onCloseWidget = function(self)
+        UIManager:setDirty(nil, function()
+            return "ui", self.movable and self.movable.dimen
+        end)
+    end
+end
+
 local function minimalDialog(title, widgets, buttons, cover_card_frame)
     -- The native ButtonTable allows exact control of face, size and weight
     -- for each row. This avoids changing the global KOReader Button class.
@@ -1328,7 +1340,9 @@ local function minimalDialog(title, widgets, buttons, cover_card_frame)
         width_factor = .92, _added_widgets = widgets, buttons = buttons,
     }
     if cover_card_frame then
-        require("flipside_frame_cover").attach(dialog)
+        -- Only the Study Calendar is created through this covered-dialog path.
+        package.loaded["flipside_audit_style"].closeDialogWithoutFlash(dialog)
+        require("flipside_frame_cover").attach(dialog, { regional_no_flash = true })
     end
     showAuditWidget(dialog)
     return dialog
@@ -1958,6 +1972,7 @@ local function showAccuracyStats(word_filter, from_flashcards)
     local selected_page = 1
     local show_trends = false
     local dialog
+    local popup_fixed_top
     -- The global popup stays alive while the user moves between the two
     -- submenu shortcuts. Use in-place native button labels for their pager:
     -- there is no reason to query SQLite or rebuild three report cards.
@@ -2210,7 +2225,7 @@ local function showAccuracyStats(word_filter, from_flashcards)
                     text = "Statistics shows your real reviews.\n\n"
                         .. "Today: answers from today.\n"
                         .. "All time: answers from all days.\n"
-                        .. "Use the arrows to see recent days, review times "
+                        .. "Swipe left or right to see recent days, review times "
                         .. "or Learning Analysis.\n\n"
                         .. "CRAM practice does not change these review scores.",
                     show_icon = false,
@@ -2249,22 +2264,14 @@ local function showAccuracyStats(word_filter, from_flashcards)
                 w=row_width,h=math.max(1,Size.line.thin)},
                 background=Blitbuffer.COLOR_GRAY}
             content[#content+1] = rule
-            -- A larger INVISIBLE target improves reliability on Kindle:
-            -- the arrow glyph stays at 22pt while touch area is >=48px high.
-            local arrow_w = math.max(48, math.floor(row_width * .15))
-            local arrow_h = math.max(48, Device.screen:scaleBySize(44))
+            local pager_h = math.max(48, Device.screen:scaleBySize(44))
             local controls = ButtonTable:new{
                 width = row_width,
                 buttons = {{
-                    {text="‹",width=arrow_w,height=arrow_h,
-                        font_face=style.name(),font_size=22,
-                        font_bold=false,callback=function()changePage(-1)end},
                     {text=current_label,id="audit_current_section",
-                        height=arrow_h,font_face=style.name(),font_size=font_size,
+                        width=row_width,height=pager_h,
+                        font_face=style.name(),font_size=font_size,
                         font_bold=false,callback=activatePage},
-                    {text="›",width=arrow_w,height=arrow_h,
-                        font_face=style.name(),font_size=22,
-                        font_bold=false,callback=function()changePage(1)end},
                 }},
             }
             content[#content+1] = controls
@@ -2324,6 +2331,17 @@ local function showAccuracyStats(word_filter, from_flashcards)
         end
         if dialog then UIManager:close(dialog) end
         dialog = popup.widget
+        -- Keep the same top edge across Statistics pages even if another
+        -- model/time selection produces a differently sized content panel.
+        -- This is only visual placement: no data or other windows change.
+        local natural_top = math.floor((height - popup.height) / 2)
+        if popup_fixed_top == nil then popup_fixed_top = natural_top end
+        local pinned_top = math.max(0, math.min(popup_fixed_top, height - popup.height))
+        if dialog.movable and dialog.movable.setMovedOffset then
+            dialog.movable:setMovedOffset(Geom:new{
+                x = 0, y = pinned_top - natural_top,
+            })
+        end
         preferred_pass = popup.pass
         navigator_row = popup.controls
         navigator_label = navigator_row:getButtonById("audit_current_section")
@@ -2331,7 +2349,38 @@ local function showAccuracyStats(word_filter, from_flashcards)
         navigator_dots_box = popup.dots_box
         -- The three-card statistics panel alone covers the measured card
         -- frame, just as the dictionary's Saved Meanings panel already does.
-        require("flipside_frame_cover").attach(dialog)
+        -- Top-level Statistics popup: suppress native close flash and the
+        -- frame-cover's former full-screen UI refresh.
+        package.loaded["flipside_audit_style"].closeDialogWithoutFlash(dialog)
+        require("flipside_frame_cover").attach(dialog, {
+            regional_no_flash = true,
+            mask_statistics_center = true,
+            pin_popup = true,
+        })
+        dialog.ges_events = dialog.ges_events or {}
+        dialog.ges_events.SwipePage = {
+            require("ui/gesturerange"):new{
+                ges = "swipe",
+                range = function()
+                    return (dialog.movable and dialog.movable.dimen) or Geom:new{
+                        x = 0, y = 0,
+                        w = Device.screen:getWidth(),
+                        h = Device.screen:getHeight(),
+                    }
+                end,
+            },
+        }
+        function dialog:onSwipePage(_, ges)
+            if popup_closed or not ges or not ges.direction then return false end
+            if ges.direction == "west" then
+                changePage(1)
+                return true
+            elseif ges.direction == "east" then
+                changePage(-1)
+                return true
+            end
+            return false
+        end
         showAuditWidget(dialog)
     end
     openDialog()
@@ -2971,10 +3020,12 @@ local function cloudGetPlugin(plugin)
     return nil, "Cloud storage service could not be accessed. Check the KOReader plugin manager."
 end
 
-local function cloudServer(plugin)
+-- Optional explicit folder is used only by Calendar; the default remains
+-- the Statistics folder. Credentials are always resolved from KOReader.
+local function cloudServer(plugin, folder_override, use_override)
     local cs, issue = cloudGetPlugin(plugin)
     if not cs then return nil, nil, issue end
-    local selection = cloud_settings:readSetting("selected_folder")
+    local selection = use_override and folder_override or cloud_settings:readSetting("selected_folder")
     if type(selection) ~= "table" or type(selection.type) ~= "string"
         or type(selection.url) ~= "string" then
         return cs, nil, "Choose a cloud folder first on this device."
@@ -4109,6 +4160,9 @@ package.loaded["flipside_learning_audit_bridge"] = auditBridge
                 end
             end,
         }
+        -- Day details use the same native ButtonDialog class. Closing the
+        -- day overlay must not flash before exposing the still-open calendar.
+        package.loaded["flipside_audit_style"].closeDialogWithoutFlash(detail)
         calendar.day_dialog=detail
         showAuditWidget(detail)
     end
@@ -5700,7 +5754,8 @@ return {
     end,
     chooseFolder = chooseAuditFolder,
     getFolder = selectedAuditFolder,
-    -- Read-only access to the existing Learning Analysis cloud transport.
-    -- Calendar exchange reuses this server; no new settings or credentials.
+    -- Share only the KOReader cloud transport adapter with Calendar.
+    -- An explicit folder can be resolved without modifying Statistics settings.
     getCloudTransport = cloudServer,
+    getCloudService = cloudGetPlugin,
 }

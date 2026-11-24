@@ -329,14 +329,32 @@ function VocabularyBuilder:insertOrUpdate(entry)
                         review_count = MAX(review_count-1, 0),
                         streak_count = 0,
                         due_time = ?,
-                        prev_context = ifnull(excluded.prev_context, prev_context),
-                        next_context = ifnull(excluded.next_context, next_context),
-                        highlight = ifnull(excluded.highlight, highlight);]]);
+                        prev_context = ifnull(nullif(excluded.prev_context, ''), prev_context),
+                        next_context = ifnull(nullif(excluded.next_context, ''), next_context),
+                        highlight = ifnull(nullif(excluded.highlight, ''), highlight);]]);
     stmt:bind(entry.word, entry.book_title, entry.time, entry.time+300, entry.time,
               entry.prev_context, entry.next_context, entry.highlight, entry.time+300)
     stmt:step()
     stmt:clearbind():reset()
     conn:close()
+end
+
+-- Refresh only missing/short captured book context. Never modify any
+-- SRS fields, title assignment, creation time, or review counters.
+function VocabularyBuilder:updateContextOnly(word, prev_context, next_context, highlight)
+    if type(word) ~= "string" or word == "" then return false end
+    if type(prev_context) ~= "string" and type(next_context) ~= "string" then return false end
+    local conn = SQ3.open(db_location)
+    local stmt = conn:prepare([[UPDATE vocabulary SET
+        prev_context = COALESCE(NULLIF(?, ''), prev_context),
+        next_context = COALESCE(NULLIF(?, ''), next_context),
+        highlight = COALESCE(NULLIF(?, ''), highlight)
+        WHERE word = ?;]])
+    stmt:bind(prev_context, next_context, highlight, word)
+    stmt:step()
+    stmt:close()
+    conn:close()
+    return true
 end
 
 function VocabularyBuilder:hasWord(word)

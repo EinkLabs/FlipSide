@@ -1,8 +1,8 @@
 # FlipSide screenshot gallery
 
-Screenshots supplied for the FlipSide public documentation. All 20 original screenshots are preserved here with unchanged image pixels and descriptive filenames. Existing screenshots in [`images/`](images/) remain in place.
+Screenshots supplied for the FlipSide public documentation. Original and updated screenshots are shown with descriptive filenames. Existing screenshots in [`images/`](images/) remain in place.
 
-These images document the `1.0.0-rc.1` user interface; some values and labels are examples from the captured review state.
+These images document the FlipSide user interface; some values and labels are examples from the captured review state.
 
 ## Flashcard designs
 
@@ -36,9 +36,9 @@ These images document the `1.0.0-rc.1` user interface; some values and labels ar
 
 <img src="gallery/238238-dictionary-definition-1.jpg" alt="Dictionary definition example 1" width="290">
 
-**Dictionary definition example 2** — original `238240.jpg`
+**Saved meaning popup — updated dark-mode example**
 
-<img src="gallery/238240-dictionary-definition-2.jpg" alt="Dictionary definition example 2" width="290">
+<img src="gallery/saved-meaning-popup.jpg" alt="Saved meaning popup over a visible flashcard" width="290">
 
 ## Study statistics and calendar
 

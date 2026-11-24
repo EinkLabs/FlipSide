@@ -1,17 +1,20 @@
-# FlipSide 1.0.0 — Release candidate 1
+# FlipSide 1.0.0
 
-FlipSide is an independent vocabulary-flashcard plugin for KOReader, with three review presentations, Smart Cram, dictionary meanings, Learning Analysis, book filters and optional Dropbox/WebDAV synchronization.
+This stable release focuses on review reliability, calendar synchronization, and saved dictionary meanings.
 
-### Highlights
+## Bug fixes and improvements
 
-- Meaning Recall, Contextual Retrieval and Sentence Card.
-- Save multiple dictionary meanings; select text using the dictionary's ON / Save controls.
-- Study calendar, review statistics, Undo and optional Smart Cram.
-- E-ink-friendly styles, font choices and multi-book review filters.
-- Separate cloud sync components for cards and related data.
+- Review queue: improved handling of cards that become due while a session is open, without rebuilding the current card or resetting Undo and Cram progress.
+- Calendar sync: added a separate cloud folder setting for the Study Calendar, including WebDAV; the Statistics folder remains the fallback until a Calendar folder is configured.
+- Saved meanings: closing the dictionary opened from Meaning Options now returns to that menu.
+- Saved meaning popup: keeps the underlying flashcard and its frame visible instead of covering the card; other popups retain their existing behavior.
+- Saved definitions: improved recovery of definitions saved under the selected word form, avoiding duplicates and respecting deleted entries.
+- Sentence context: improved recognition of complete preceding sentences that begin with quotation marks.
 
-### Install
+## Installation
 
-Extract `flipside.koplugin/` to `koreader/plugins/`, restart KOReader and open FlipSide. Back up `koreader/settings/flipside/` before updating or syncing across devices.
+Back up your FlipSide settings and vocabulary before updating. Extract the release installer into `koreader/plugins/`, replacing the existing `flipside.koplugin/` directory, then restart KOReader.
 
-**Status:** pre-release candidate. Real device and cross-device behaviour should be checked before announcing a stable 1.0.0. Source available under AGPL-3.0; see `COPYING` and `NOTICE.txt`.
+Device behavior may vary with KOReader versions. Automated checks do not replace Android and Kindle testing, particularly for cloud synchronization and e-ink rendering.
+
+License: AGPL-3.0; see COPYING and NOTICE.txt.
